@@ -249,7 +249,7 @@ def _setup_ai_features() -> None:
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "openai":
         api_key = Prompt.ask("OpenAI API key")
-        model = Prompt.ask("Model", default="gpt-4o-mini")
+        model = Prompt.ask("Model", default="gpt-4o")
         env_lines.append(f"OPENAI_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "local":

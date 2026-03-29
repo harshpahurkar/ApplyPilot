@@ -1,0 +1,154 @@
+\documentclass[letterpaper,11pt]{article}
+
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\input{glyphtounicode}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-.5in}
+\addtolength{\textheight}{1.0in}
+
+\urlstyle{same}
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+\pdfgentounicode=1
+
+%--- Custom commands ---
+\newcommand{\resumeItem}[1]{
+  \item\small{
+    {#1 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeSubSubheading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \textit{\small#1} & \textit{\small #2} \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeProjectHeading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & #2 \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-4pt}}
+
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+\begin{document}
+
+\begin{center}
+    \textbf{\Huge \scshape Harsh Pahurkar} \\ \vspace{1pt}
+    \small +1-437-973-0603 $|$ \href{mailto:harshpahurkar33@gmail.com}{\underline{harshpahurkar33@gmail.com}} $|$ \href{https://linkedin.com/in/harshpahurkar}{\underline{linkedin.com/in/harshpahurkar}} $|$ \href{https://github.com/harshpahurkar}{\underline{github.com/harshpahurkar}}
+\end{center}
+
+%-----------EDUCATION-----------
+\section{Education}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Seneca College}{Toronto, ON}
+      {Advanced Diploma}{Jan. 2023 - Dec. 2025}
+      \resumeItemListStart
+        \resumeItem{\textbf{Coursework}: Software Testing, Automation Frameworks, Database Management}
+      \resumeItemListEnd
+  \resumeSubHeadingListEnd
+
+%-----------EXPERIENCE-----------
+\section{Experience}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Ministry of Children, Community and Social Services}{Toronto, ON}
+      {Software/Automation Developer}{Jan. 2024 - Aug. 2024}
+      \resumeItemListStart
+        \resumeItem{Achieved 95\% code coverage by engineering CI/CD pipelines in Azure DevOps, cutting deployment cycles from 2 weeks to 3 days}
+        \resumeItem{Reduced manual testing by 75\% by developing an automation framework using Java Selenium and TestNG, enhancing testing efficiency across 12 applications}
+        \resumeItem{Built an API testing framework with RestAssured, validating over 200 endpoints and improving response speed by 60\%}
+        \resumeItem{\textbf{Skills}: Java, Selenium, TestNG, RestAssured, Azure DevOps, CI/CD, Git, Agile}
+      \resumeItemListEnd
+
+    \resumeSubheading
+      {Affimintus Technologies}{Indore, India}
+      {Software Developer}{June 2021 - Dec. 2022}
+      \resumeItemListStart
+        \resumeItem{Developed RESTful APIs and microservices handling over 1M requests/day, ensuring 99.9\% uptime for 10K+ daily users}
+        \resumeItem{Optimized SQL queries improving database performance by 80\%, facilitating faster data retrieval and processing}
+        \resumeItem{Automated deployment processes reducing release time by 65\%, enhancing overall development efficiency}
+        \resumeItem{\textbf{Skills}: Java, Spring Boot, React, RESTful APIs, Microservices, PostgreSQL, MongoDB, Git, CI/CD}
+      \resumeItemListEnd
+
+  \resumeSubHeadingListEnd
+
+%-----------PROJECTS-----------
+\section{Projects}
+  \resumeSubHeadingListStart
+    \resumeProjectHeading
+      {\textbf{Fragments Microservice} $|$ \emph{\small Node.js, AWS, Docker, PostgreSQL}}{Dec. 2025 - Present}
+      \resumeItemListStart
+        \resumeItem{Achieved 98\% code coverage with 120+ automated tests by implementing a cloud-native REST microservice handling 100+ daily requests}
+        \resumeItem{Containerized application with Docker and deployed on AWS ECS, ensuring reliable performance and scalability}
+        \resumeItem{Automated CI/CD pipeline using GitHub Actions, streamlining deployment processes and enhancing team productivity}
+        \resumeItem{\textbf{Skills}: Node.js, Express.js, AWS (S3, DynamoDB, Cognito, ECS), Docker, GitHub Actions, RESTful APIs}
+      \resumeItemListEnd
+
+    \resumeProjectHeading
+      {\textbf{Housify - AI Real Estate Platform} $|$ \emph{\small TensorFlow, Solidity, Hardhat, React, Vercel}}{Mar. 2024 - Present}
+      \resumeItemListStart
+        \resumeItem{Achieved 94\% accuracy on 1K+ Toronto listings by developing a machine learning property valuation model using TensorFlow}
+        \resumeItem{Implemented Web3.js integration for cryptocurrency payments and NFT-based property ownership transfers, enhancing user experience}
+        \resumeItem{Built Ethereum smart contracts using Solidity and Hardhat, ensuring secure and efficient transactions}
+        \resumeItem{\textbf{Skills}: Solidity, Ethereum, Hardhat, React, Web3.js, TensorFlow, Vercel}
+      \resumeItemListEnd
+
+  \resumeSubHeadingListEnd
+
+%-----------TECHNICAL SKILLS-----------
+\section{Technical Skills}
+ \begin{itemize}[leftmargin=0.15in, label={}]
+    \small{\item{
+     \textbf{Languages}{: Java, Python, JavaScript, TypeScript} \\
+     \textbf{Frameworks}{: React, Node.js, Spring Boot, Flask} \\
+     \textbf{Developer Tools}{: Git, Docker, Jenkins, Azure DevOps} \\
+     \textbf{Databases and Libraries}{: PostgreSQL, MongoDB, DynamoDB}
+    }}
+ \end{itemize}
+
+\end{document}

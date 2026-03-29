@@ -162,10 +162,10 @@ def load_base_urls() -> dict[str, str | None]:
 # ---------------------------------------------------------------------------
 
 DEFAULTS = {
-    "min_score": 7,
+    "min_score": 6,
     "max_apply_attempts": 3,
     "max_tailor_attempts": 5,
-    "poll_interval": 60,
+    "poll_interval": 15,
     "apply_timeout": 300,
     "viewport": "1280x900",
 }
@@ -197,40 +197,51 @@ TIER_COMMANDS: dict[int, list[str]] = {
 }
 
 
-def get_tier() -> int:
+def _has_apply_backend(backend: str) -> bool:
+    """Return True when the selected apply backend CLI is available."""
+    backend_norm = (backend or "claude").strip().lower()
+    if backend_norm == "copilot":
+        return bool(shutil.which("copilot") or shutil.which("gh"))
+    if backend_norm == "auto":
+        return bool(shutil.which("claude") or shutil.which("copilot") or shutil.which("gh"))
+    return bool(shutil.which("claude"))
+
+
+def get_tier(apply_backend: str = "claude") -> int:
     """Detect the current tier based on available dependencies.
 
     Tier 1 (Discovery):            Python + pip
     Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 3 (Full Auto-Apply):       + Chrome + selected agent CLI
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL", "DEEPSEEK_API_KEY"))
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    # Tier 3 needs Chrome + selected backend CLI
+    if has_chrome and _has_apply_backend(apply_backend):
         return 3
 
     return 2
 
 
-def check_tier(required: int, feature: str) -> None:
+def check_tier(required: int, feature: str, apply_backend: str = "claude") -> None:
     """Raise SystemExit with a clear message if the current tier is too low.
 
     Args:
         required: Minimum tier needed (1, 2, or 3).
         feature: Human-readable description of the feature being gated.
     """
-    current = get_tier()
+    backend_norm = (apply_backend or "claude").strip().lower()
+    current = get_tier(apply_backend=backend_norm)
     if current >= required:
         return
 
@@ -238,15 +249,22 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL", "DEEPSEEK_API_KEY")):
+        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY / LLM_URL")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
         try:
             get_chrome_path()
         except FileNotFoundError:
             missing.append("Chrome/Chromium — install or set CHROME_PATH")
+        if backend_norm == "copilot":
+            if not (shutil.which("copilot") or shutil.which("gh")):
+                missing.append("Copilot CLI — install GitHub Copilot CLI (or GitHub CLI with Copilot extension)")
+        elif backend_norm == "auto":
+            if not (shutil.which("claude") or shutil.which("copilot") or shutil.which("gh")):
+                missing.append("Agent CLI — install Claude Code CLI or Copilot CLI")
+        else:
+            if not shutil.which("claude"):
+                missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
 
     _console.print(
         f"\n[red]'{feature}' requires {TIER_LABELS.get(required, f'Tier {required}')} (Tier {required}).[/red]\n"

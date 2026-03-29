@@ -209,6 +209,16 @@ def launch_chrome(worker_id: int, port: int | None = None,
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
 
+    # Clear cookies from previous job to prevent cross-site contamination
+    # (e.g., SAP SuccessFactors session leaking into Workday)
+    for cookie_file in ("Cookies", "Cookies-journal"):
+        cf = profile_dir / "Default" / cookie_file
+        if cf.exists():
+            try:
+                cf.unlink()
+            except (PermissionError, OSError):
+                pass
+
     chrome_exe = config.get_chrome_path()
 
     cmd = [
@@ -231,6 +241,8 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--use-fake-ui-for-media-stream",
         "--deny-permission-prompts",
         "--disable-notifications",
+        # Start with a blank page to avoid loading stale URLs
+        "about:blank",
     ]
     if headless:
         cmd.append("--headless=new")

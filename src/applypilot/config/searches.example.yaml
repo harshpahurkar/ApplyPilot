@@ -56,34 +56,44 @@ queries:
 
 # Locations to search
 locations:
-  - location: "San Francisco, CA"
+  - location: "Toronto, ON"
     remote: false
   - location: "Remote"
     remote: true
+  - location: "Canada"
+    remote: false
 
 # Location filtering -- accept/reject patterns for job location text
 location:
   accept_patterns:
-    - "San Francisco"
-    - "Bay Area"
-    - "SF"
-    - "California"
-    - "CA"
+    - "Toronto"
+    - "Ontario"
+    - "ON"
+    - "Canada"
     - "Remote"
     - "Anywhere"
-    - "United States"
-    - "US"
-    - "USA"
+    - "Work from home"
+    - "Hybrid"
+    - "Montreal"
+    - "Vancouver"
+    - "Ottawa"
+    - "Calgary"
+    - "British Columbia"
+    - "BC"
+    - "Alberta"
+    - "AB"
+    - "Quebec"
+    - "QC"
   reject_patterns:
-    - "New York only"
-    - "Seattle only"
-    - "onsite only"
+    - "United States"
+    - "USA"
+    - "US"
     - "London, UK"
     - "India"
     - "Philippines"
 
 # Country for Indeed/LinkedIn/Google Jobs searches
-country: "USA"
+country: "Canada"
 
 # JobSpy source boards (all available options shown)
 boards:

@@ -8,7 +8,9 @@ profile at runtime. No hardcoded personal information.
 import json
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
@@ -106,7 +108,11 @@ Output ONLY the letter. Start with "Dear Hiring Manager," end with the name."""
 # ── Core Generation ──────────────────────────────────────────────────────
 
 def generate_cover_letter(
-    resume_text: str, job: dict, profile: dict, max_retries: int = 3
+    resume_text: str,
+    job: dict,
+    profile: dict,
+    max_retries: int = 3,
+    validation_mode: str = "normal",
 ) -> str:
     """Generate a cover letter with fresh context on each retry + auto-sanitize.
 
@@ -151,10 +157,10 @@ def generate_cover_letter(
             )},
         ]
 
-        letter = client.chat(messages, max_tokens=1024, temperature=0.7)
+        letter = client.chat(messages, max_tokens=4096, temperature=0.3)
         letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
 
-        validation = validate_cover_letter(letter)
+        validation = validate_cover_letter(letter, validation_mode=validation_mode)
         if validation["passed"]:
             return letter
 
@@ -169,12 +175,19 @@ def generate_cover_letter(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_cover_letters(min_score: int = 7, limit: int = 20) -> dict:
+def run_cover_letters(
+    min_score: int = 7,
+    limit: int = 20,
+    workers: int = 1,
+    validation_mode: str = "normal",
+) -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes.
 
     Args:
         min_score: Minimum fit_score threshold.
         limit: Maximum jobs to process.
+        workers: Number of parallel workers.
+        validation_mode: Validation strictness for cover-letter checks.
 
     Returns:
         {"generated": int, "errors": int, "elapsed": float}
@@ -190,7 +203,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20) -> dict:
         "AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_attempts, 0) < ? "
-        "ORDER BY fit_score DESC LIMIT ?",
+        "ORDER BY COALESCE(date_posted, discovered_at) DESC, fit_score DESC LIMIT ?",
         (min_score, MAX_ATTEMPTS, limit),
     ).fetchall()
 
@@ -205,20 +218,24 @@ def run_cover_letters(min_score: int = 7, limit: int = 20) -> dict:
 
     COVER_LETTER_DIR.mkdir(parents=True, exist_ok=True)
     log.info(
-        "Generating cover letters for %d jobs (score >= %d)...",
-        len(jobs), min_score,
+        "Generating cover letters for %d jobs (score >= %d, %d workers)...",
+        len(jobs), min_score, workers,
     )
     t0 = time.time()
     completed = 0
     results: list[dict] = []
     error_count = 0
+    _lock = threading.Lock()
 
-    for job in jobs:
-        completed += 1
+    def _process_one_cover(job: dict) -> dict:
         try:
-            letter = generate_cover_letter(resume_text, job, profile)
+            letter = generate_cover_letter(
+                resume_text,
+                job,
+                profile,
+                validation_mode=validation_mode,
+            )
 
-            # Build safe filename prefix
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
             prefix = f"{safe_site}_{safe_title}"
@@ -226,55 +243,80 @@ def run_cover_letters(min_score: int = 7, limit: int = 20) -> dict:
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")
 
-            # Generate PDF (best-effort)
             pdf_path = None
             try:
-                from applypilot.scoring.pdf import convert_to_pdf
-                pdf_path = str(convert_to_pdf(cl_path))
+                from applypilot.scoring.pdf import compile_cover_letter_pdf
+                pdf_path = str(compile_cover_letter_pdf(cl_path))
             except Exception:
                 log.debug("PDF generation failed for %s", cl_path, exc_info=True)
 
-            result = {
+            return {
                 "url": job["url"],
                 "path": str(cl_path),
                 "pdf_path": pdf_path,
                 "title": job["title"],
                 "site": job["site"],
             }
-            results.append(result)
-
-            elapsed = time.time() - t0
-            rate = completed / elapsed if elapsed > 0 else 0
-            log.info(
-                "%d/%d [OK] | %.1f jobs/min | %s",
-                completed, len(jobs), rate * 60, result["title"][:40],
-            )
         except Exception as e:
-            result = {
+            log.error("[ERROR] %s -- %s", job["title"][:40], e)
+            return {
                 "url": job["url"], "title": job["title"], "site": job["site"],
                 "path": None, "pdf_path": None, "error": str(e),
             }
-            error_count += 1
-            results.append(result)
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
-    # Persist to DB: increment attempt counter for ALL, save path only for successes
-    now = datetime.now(timezone.utc).isoformat()
+    _pending_commit: list[dict] = []
+    COMMIT_EVERY = 5
     saved = 0
-    for r in results:
-        if r.get("path"):
-            conn.execute(
-                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
-                "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
+
+    def _flush_pending_cover(pending: list[dict]) -> None:
+        nonlocal saved
+        now = datetime.now(timezone.utc).isoformat()
+        for r in pending:
+            if r.get("path"):
+                conn.execute(
+                    "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
+                    "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                    (r["path"], now, r["url"]),
+                )
+                saved += 1
+            else:
+                conn.execute(
+                    "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                    (r["url"],),
+                )
+        conn.commit()
+
+    def _on_result(result: dict):
+        nonlocal completed, error_count
+        with _lock:
+            completed += 1
+            results.append(result)
+            _pending_commit.append(result)
+            if result.get("error"):
+                error_count += 1
+            elapsed = time.time() - t0
+            rate = completed / elapsed if elapsed > 0 else 0
+            status = "ERROR" if result.get("error") else "OK"
+            log.info(
+                "%d/%d [%s] | %.1f jobs/min | %s",
+                completed, len(jobs), status, rate * 60, result["title"][:40],
             )
-            saved += 1
-        else:
-            conn.execute(
-                "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
+            if len(_pending_commit) >= COMMIT_EVERY:
+                _flush_pending_cover(_pending_commit.copy())
+                _pending_commit.clear()
+
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_one_cover, job): job for job in jobs}
+            for future in as_completed(futures):
+                _on_result(future.result())
+    else:
+        for job in jobs:
+            _on_result(_process_one_cover(job))
+
+    # Flush remaining
+    if _pending_commit:
+        _flush_pending_cover(_pending_commit)
 
     elapsed = time.time() - t0
     log.info("Cover letters done in %.1fs: %d generated, %d errors", elapsed, saved, error_count)

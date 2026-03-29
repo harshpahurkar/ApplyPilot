@@ -98,6 +98,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             site                  TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
+            date_posted           TEXT,
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
@@ -153,6 +154,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
+    "date_posted": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -410,7 +412,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         where += " AND fit_score >= ?"
         params.append(min_score)
 
-    query = f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    query = f"SELECT * FROM jobs WHERE {where} ORDER BY COALESCE(date_posted, discovered_at) DESC, fit_score DESC NULLS LAST"
     if limit > 0:
         query += " LIMIT ?"
         params.append(limit)

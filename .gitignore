@@ -14,6 +14,11 @@ chrome-workers/
 apply-workers/
 apply_logs/
 logs/
+proxy_stdout.log
+proxy_stderr.log
+
+# Dev/debug scripts (archived)
+_dev/
 
 # MCP configs (per-machine)
 .mcp*.json

@@ -1,0 +1,2 @@
+Jobs passing ALL DB filters: 519
+In progress: 0

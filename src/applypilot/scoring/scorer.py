@@ -8,7 +8,9 @@ profile and resume file.
 import json
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from applypilot.config import RESUME_PATH, load_profile
@@ -20,25 +22,35 @@ log = logging.getLogger(__name__)
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
 
-SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+SCORE_PROMPT = """You are an ATS-aware job fit evaluator. Given a candidate's resume and a job description, perform a thorough ATS-style analysis and score the match.
 
-SCORING CRITERIA:
-- 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
-- 7-8: Strong match. Candidate has most required skills, minor gaps easily bridged.
-- 5-6: Moderate match. Candidate has some relevant skills but missing key requirements.
-- 3-4: Weak match. Significant skill gaps, would need substantial ramp-up.
-- 1-2: Poor match. Completely different field or experience level.
+## ANALYSIS STEPS (do all internally before scoring):
+1. Identify the top 10 keywords/phrases from the JD that an ATS would scan for
+2. Check which of those keywords appear in the resume (exact or close match)
+3. Identify skills gaps that would hurt the application
+4. Check industry-specific terminology alignment
+5. Evaluate seniority-level language match (junior/senior/lead)
+6. Assess technical requirements coverage
+7. Note soft skills from the JD that are present or missing
 
-IMPORTANT FACTORS:
-- Weight technical skills heavily (programming languages, frameworks, tools)
-- Consider transferable experience (automation, scripting, API work)
-- Factor in the candidate's project experience
-- Be realistic about experience level vs. job requirements (years of experience, seniority)
+## SCORING CRITERIA:
+- 9-10: ATS would rank in top 5%. 8+ of 10 critical keywords present. Direct experience in nearly all required skills. Seniority match.
+- 7-8: ATS would rank in top 20%. 6-7 of 10 keywords present. Most required skills covered, minor gaps easily bridged by tailoring.
+- 5-6: ATS would flag as borderline. 4-5 keywords present. Some relevant skills but missing key requirements. Tailoring could help significantly.
+- 3-4: ATS would likely reject. Under 4 keywords. Significant skill gaps, different domain or seniority level.
+- 1-2: ATS auto-reject. Completely different field, experience level, or tech stack.
+
+## IMPORTANT FACTORS:
+- Weight technical skills and exact keyword matches heavily (this is what ATS systems do)
+- Consider transferable experience (automation, scripting, API work) as bridgeable gaps
+- Factor in the candidate's project experience as evidence of skills
+- Be realistic about experience level vs job requirements
+- Consider if the resume could be tailored to score 90+ on an ATS for this JD
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
-KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
-REASONING: [2-3 sentences explaining the score]"""
+KEYWORDS: [comma-separated top ATS keywords from the JD that match or could match the candidate]
+REASONING: [2-3 sentences: match percentage, key gaps, and whether tailoring could bridge them]"""
 
 
 def _parse_score_response(response: str) -> dict:
@@ -94,19 +106,20 @@ def score_job(resume_text: str, job: dict) -> dict:
 
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        response = client.chat(messages, max_tokens=2048, temperature=0.0)
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
-def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
+def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
         limit: Maximum number of jobs to score in this run.
         rescore: If True, re-score all jobs (not just unscored ones).
+        workers: Number of parallel scoring threads (default 3).
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
@@ -131,38 +144,59 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
 
-    log.info("Scoring %d jobs sequentially...", len(jobs))
+    log.info("Scoring %d jobs (%d workers)...", len(jobs), workers)
     t0 = time.time()
-    completed = 0
-    errors = 0
-    results: list[dict] = []
+    total_scored = 0
+    total_errors = 0
+    _pending: list[dict] = []
+    _lock = threading.Lock()
+    COMMIT_EVERY = 10
 
-    for job in jobs:
+    def _flush(pending: list[dict]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        for r in pending:
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+            )
+        conn.commit()
+
+    def _on_result(result: dict, idx: int) -> None:
+        nonlocal total_scored, total_errors
+        with _lock:
+            total_scored += 1
+            if result["score"] == 0:
+                total_errors += 1
+            _pending.append(result)
+            log.info("[%d/%d] score=%d  %s", idx, len(jobs), result["score"], result.get("title", "?")[:60])
+            if len(_pending) >= COMMIT_EVERY:
+                _flush(_pending.copy())
+                _pending.clear()
+
+    def _score_one(job: dict, idx: int) -> tuple[dict, int]:
         result = score_job(resume_text, job)
         result["url"] = job["url"]
-        completed += 1
+        result["title"] = job.get("title", "?")
+        return result, idx
 
-        if result["score"] == 0:
-            errors += 1
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_score_one, job, i + 1): job for i, job in enumerate(jobs)}
+            for future in as_completed(futures):
+                result, idx = future.result()
+                _on_result(result, idx)
+    else:
+        for i, job in enumerate(jobs):
+            result, idx = _score_one(job, i + 1)
+            _on_result(result, idx)
 
-        results.append(result)
-
-        log.info(
-            "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], job.get("title", "?")[:60],
-        )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
+    # Flush remaining
+    with _lock:
+        if _pending:
+            _flush(_pending)
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", total_scored, elapsed, total_scored / elapsed if elapsed > 0 else 0)
 
     # Score distribution
     dist = conn.execute("""
@@ -173,8 +207,8 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     distribution = [(row[0], row[1]) for row in dist]
 
     return {
-        "scored": len(results),
-        "errors": errors,
+        "scored": total_scored,
+        "errors": total_errors,
         "elapsed": elapsed,
         "distribution": distribution,
     }

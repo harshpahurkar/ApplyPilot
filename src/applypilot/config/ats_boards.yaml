@@ -1,0 +1,260 @@
+# ATS Board registries for ApplyPilot
+# Greenhouse, Lever, and Ashby company career boards
+#
+# These ATS platforms have public JSON APIs — zero browser, zero LLM.
+# The scraper fetches ALL open positions from each company, then filters
+# by title keywords (from your searches.yaml queries) and location.
+#
+# To add a company:
+#   1. Visit their careers page
+#   2. Check if the URL contains greenhouse.io, lever.co, or ashbyhq.com
+#   3. Extract the board token / slug from the URL
+#   4. Add it below under the correct platform section
+#
+# Invalid entries are skipped gracefully (404 = silently ignored).
+
+# ── Greenhouse ───────────────────────────────────────────────────────────
+# Career URL pattern: boards.greenhouse.io/{board_token}
+# API: GET https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs
+
+greenhouse:
+
+  # Canadian tech
+  wealthsimple:
+    name: "Wealthsimple"
+    board_token: "wealthsimple"
+  shopify:
+    name: "Shopify"
+    board_token: "shopify"
+  clio:
+    name: "Clio"
+    board_token: "clio"
+  hootsuite:
+    name: "Hootsuite"
+    board_token: "hootsuite"
+  freshbooks:
+    name: "FreshBooks"
+    board_token: "freshbooks"
+  vidyard:
+    name: "Vidyard"
+    board_token: "vidyard"
+  1password:
+    name: "1Password"
+    board_token: "1password"
+
+  # Big tech / FAANG-adjacent
+  airbnb:
+    name: "Airbnb"
+    board_token: "airbnb"
+  discord:
+    name: "Discord"
+    board_token: "discord"
+  doordash:
+    name: "DoorDash"
+    board_token: "doordash"
+  figma:
+    name: "Figma"
+    board_token: "figma"
+  gitlab:
+    name: "GitLab"
+    board_token: "gitlab"
+  lyft:
+    name: "Lyft"
+    board_token: "lyft"
+  pinterest:
+    name: "Pinterest"
+    board_token: "pinterest"
+  reddit:
+    name: "Reddit"
+    board_token: "reddit"
+  snap:
+    name: "Snap"
+    board_token: "snap"
+  spotify:
+    name: "Spotify"
+    board_token: "spotify"
+  stripe:
+    name: "Stripe"
+    board_token: "stripe"
+  twitch:
+    name: "Twitch"
+    board_token: "twitch"
+
+  # Unicorns / high-growth
+  canva:
+    name: "Canva"
+    board_token: "canva"
+  cloudflare:
+    name: "Cloudflare"
+    board_token: "cloudflare"
+  coinbase:
+    name: "Coinbase"
+    board_token: "coinbase"
+  datadog:
+    name: "Datadog"
+    board_token: "datadog"
+  duolingo:
+    name: "Duolingo"
+    board_token: "duolingo"
+  elastic:
+    name: "Elastic"
+    board_token: "elastic"
+  flexport:
+    name: "Flexport"
+    board_token: "flexport"
+  hashicorp:
+    name: "HashiCorp"
+    board_token: "hashicorp"
+  hubspot:
+    name: "HubSpot"
+    board_token: "hubspot"
+  instacart:
+    name: "Instacart"
+    board_token: "instacart"
+  intercom:
+    name: "Intercom"
+    board_token: "intercom"
+  mongodb:
+    name: "MongoDB"
+    board_token: "mongodb"
+  newrelic:
+    name: "New Relic"
+    board_token: "newrelic"
+  notion:
+    name: "Notion"
+    board_token: "notion"
+  okta:
+    name: "Okta"
+    board_token: "okta"
+  plaid:
+    name: "Plaid"
+    board_token: "plaid"
+  robinhood:
+    name: "Robinhood"
+    board_token: "robinhood"
+  samsara:
+    name: "Samsara"
+    board_token: "samsara"
+  toast:
+    name: "Toast"
+    board_token: "toast"
+  twilio:
+    name: "Twilio"
+    board_token: "twilio"
+  unity:
+    name: "Unity"
+    board_token: "unity"
+  webflow:
+    name: "Webflow"
+    board_token: "webflow"
+
+  # Developer tools / infra
+  cockroachlabs:
+    name: "Cockroach Labs"
+    board_token: "cockroachlabs"
+  cohere:
+    name: "Cohere"
+    board_token: "cohere"
+  sourcegraph:
+    name: "Sourcegraph"
+    board_token: "sourcegraph"
+  airtable:
+    name: "Airtable"
+    board_token: "airtable"
+  retool:
+    name: "Retool"
+    board_token: "retool"
+  gusto:
+    name: "Gusto"
+    board_token: "gusto"
+  coursera:
+    name: "Coursera"
+    board_token: "coursera"
+
+
+# ── Lever ────────────────────────────────────────────────────────────────
+# Career URL pattern: jobs.lever.co/{company_slug}
+# API: GET https://api.lever.co/v0/postings/{company_slug}
+
+lever:
+
+  affirm:
+    name: "Affirm"
+    company_slug: "affirm"
+  anduril:
+    name: "Anduril"
+    company_slug: "anduril"
+  brex:
+    name: "Brex"
+    company_slug: "brex"
+  crowdstrike:
+    name: "CrowdStrike"
+    company_slug: "crowdstrike"
+  databricks:
+    name: "Databricks"
+    company_slug: "databricks"
+  digitalocean:
+    name: "DigitalOcean"
+    company_slug: "digitalocean"
+  grammarly:
+    name: "Grammarly"
+    company_slug: "grammarly"
+  lever:
+    name: "Lever"
+    company_slug: "lever"
+  netlify:
+    name: "Netlify"
+    company_slug: "netlify"
+  noom:
+    name: "Noom"
+    company_slug: "noom"
+  opensea:
+    name: "OpenSea"
+    company_slug: "opensea"
+  rippling:
+    name: "Rippling"
+    company_slug: "rippling"
+  scaleai:
+    name: "Scale AI"
+    company_slug: "scaleai"
+  zapier:
+    name: "Zapier"
+    company_slug: "zapier"
+
+
+# ── Ashby ────────────────────────────────────────────────────────────────
+# Career URL pattern: jobs.ashbyhq.com/{board_slug}
+# API: GET https://api.ashbyhq.com/posting-api/job-board/{board_slug}
+
+ashby:
+
+  anthropic:
+    name: "Anthropic"
+    board_slug: "anthropic"
+  linear:
+    name: "Linear"
+    board_slug: "linear"
+  ramp:
+    name: "Ramp"
+    board_slug: "ramp"
+  vercel:
+    name: "Vercel"
+    board_slug: "vercel"
+  deel:
+    name: "Deel"
+    board_slug: "deel"
+  drata:
+    name: "Drata"
+    board_slug: "drata"
+  grafana:
+    name: "Grafana Labs"
+    board_slug: "grafana"
+  runway:
+    name: "Runway"
+    board_slug: "runway"
+  watershed:
+    name: "Watershed"
+    board_slug: "watershed"
+  clerk:
+    name: "Clerk"
+    board_slug: "clerk"

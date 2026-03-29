@@ -38,9 +38,9 @@ blocked:
     - "%ultipro%"
     # SuccessFactors — requires account creation + CAPTCHA
     - "%successfactors%"
-    # Workday — CAN be automated with Claude Code + CapSolver + Gmail MCP
-    # - "%myworkdayjobs.com%"
-    # - "%workday.com%"
+    # Workday — requires account creation, not automatable
+    - "%myworkdayjobs.com%"
+    - "%workday.com%"
     # Job aggregators — not real ATS, no application forms
     - "%bebee.com%"
     - "%simplyhired%"
@@ -179,10 +179,7 @@ base_urls:
   "Remote AI Jobs": "https://www.moaijobs.com"
   "Underdog.io": "https://underdog.io"
 
-# sites list temporarily disabled — Gemini quota exhausted; Ollama reserved for scoring/tailoring.
-# Full list restored from sites.yaml.backup when Gemini resets (8am UTC).
-sites: []
-_sites_disabled:
+sites:
   # ── Searchable sites (URL includes query + location params) ──────────
   # Canada-specific
   - name: "Eluta"

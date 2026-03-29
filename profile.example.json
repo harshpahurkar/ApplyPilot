@@ -4,6 +4,8 @@
     "preferred_name": "YOUR_PREFERRED_NAME",
     "email": "your.email@example.com",
     "password": "YOUR_JOB_SITE_PASSWORD",
+    "google_email": "your.google@gmail.com",
+    "google_password": "YOUR_GOOGLE_PASSWORD",
     "phone": "555-123-4567",
     "address": "123 Main St",
     "city": "Your City",

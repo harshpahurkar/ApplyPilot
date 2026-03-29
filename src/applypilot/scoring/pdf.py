@@ -1,15 +1,113 @@
-"""Text-to-PDF conversion for tailored resumes and cover letters.
+"""Resume PDF generation: LaTeX compilation + legacy text-to-PDF fallback.
 
-Parses the structured text resume format, renders via an HTML/CSS template,
-and exports to PDF using headless Chromium via Playwright.
+Primary path: compile .tex files (Jake's Resume template) to PDF via pdflatex.
+Fallback path: parse structured text, render via HTML/CSS, export via Playwright.
 """
 
 import logging
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 from applypilot.config import TAILORED_DIR
 
 log = logging.getLogger(__name__)
+
+
+# ── LaTeX Compilation (primary path) ─────────────────────────────────────
+
+def compile_latex_to_pdf(
+    tex_path: Path, output_path: Path | None = None, clean: bool = True
+) -> Path:
+    """Compile a .tex file to PDF using pdflatex.
+
+    Runs pdflatex twice (for proper cross-references) in a temp directory
+    to avoid cluttering the source folder with .aux/.log files.
+
+    Args:
+        tex_path: Path to the .tex file to compile.
+        output_path: Optional override for the output PDF path.
+            Defaults to same name with .pdf extension.
+        clean: Whether to remove auxiliary files after compilation.
+
+    Returns:
+        Path to the generated PDF file.
+
+    Raises:
+        FileNotFoundError: If pdflatex is not installed.
+        RuntimeError: If compilation fails.
+    """
+    tex_path = Path(tex_path)
+    if not tex_path.exists():
+        raise FileNotFoundError(f"LaTeX source not found: {tex_path}")
+
+    # Find pdflatex -- check PATH first, then known install locations
+    pdflatex = shutil.which("pdflatex")
+    if not pdflatex:
+        # Search common MiKTeX / TeX Live install locations
+        import os
+        _candidates = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "MiKTeX" / "miktex" / "bin" / "x64" / "pdflatex.exe",
+            Path("C:/Program Files/MiKTeX/miktex/bin/x64/pdflatex.exe"),
+            Path(os.path.expanduser("~")) / "AppData" / "Local" / "Programs" / "MiKTeX" / "miktex" / "bin" / "x64" / "pdflatex.exe",
+            Path("C:/texlive/2024/bin/windows/pdflatex.exe"),
+            Path("C:/texlive/2025/bin/windows/pdflatex.exe"),
+            Path("C:/texlive/2026/bin/windows/pdflatex.exe"),
+        ]
+        for cand in _candidates:
+            if cand.exists():
+                pdflatex = str(cand)
+                log.info("Found pdflatex at fallback location: %s", pdflatex)
+                break
+    if not pdflatex:
+        raise FileNotFoundError(
+            "pdflatex not found. Install MiKTeX (https://miktex.org) or "
+            "TeX Live (https://tug.org/texlive/) and ensure pdflatex is on PATH."
+        )
+
+    out = output_path or tex_path.with_suffix(".pdf")
+    out = Path(out)
+
+    # Compile in a temp directory to keep things clean
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        tmp_tex = tmp / tex_path.name
+        tmp_tex.write_text(tex_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        cmd = [
+            pdflatex,
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-output-directory", str(tmp),
+            str(tmp_tex),
+        ]
+
+        # Run twice for cross-references
+        for run in range(2):
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120, cwd=str(tmp)
+            )
+            if result.returncode != 0 and run == 1:
+                log_file = tmp / tex_path.with_suffix(".log").name
+                log_content = ""
+                if log_file.exists():
+                    log_content = log_file.read_text(encoding="utf-8", errors="replace")[-2000:]
+                raise RuntimeError(
+                    f"pdflatex failed (exit {result.returncode}).\n"
+                    f"STDERR: {result.stderr[:500]}\n"
+                    f"LOG (last 2000 chars): {log_content}"
+                )
+
+        # Copy PDF to final destination
+        tmp_pdf = tmp / tex_path.with_suffix(".pdf").name
+        if not tmp_pdf.exists():
+            raise RuntimeError(f"pdflatex did not produce a PDF: {tmp_pdf}")
+
+        shutil.copy2(str(tmp_pdf), str(out))
+
+    log.info("PDF compiled: %s", out)
+    return out
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
@@ -355,35 +453,105 @@ def render_pdf(html: str, output_path: str) -> None:
         browser.close()
 
 
+# ── Cover Letter PDF ─────────────────────────────────────────────────────
+
+def compile_cover_letter_pdf(
+    txt_path: Path, output_path: Path | None = None
+) -> Path:
+    """Compile a plain-text cover letter to PDF via pdflatex.
+
+    Uses a minimal LaTeX document with clean, professional formatting.
+    No resume parsing — just straight paragraph text.
+
+    Args:
+        txt_path: Path to the .txt cover letter file.
+        output_path: Optional override for the output PDF path.
+
+    Returns:
+        Path to the generated PDF file.
+    """
+    txt_path = Path(txt_path)
+    text = txt_path.read_text(encoding="utf-8").strip()
+
+    # Escape LaTeX special characters
+    def _esc(s: str) -> str:
+        for ch in ("\\", "&", "%", "$", "#", "_", "{", "}"):
+            s = s.replace(ch, f"\\{ch}")
+        s = s.replace("~", r"\textasciitilde{}")
+        s = s.replace("^", r"\textasciicircum{}")
+        # Smart quotes → straight
+        s = s.replace("\u2018", "'").replace("\u2019", "'")
+        s = s.replace("\u201c", "``").replace("\u201d", "''")
+        # Em/en dashes → hyphens (should be caught by validator, but just in case)
+        s = s.replace("\u2014", "---").replace("\u2013", "--")
+        return s
+
+    escaped = _esc(text)
+    # Convert double newlines to paragraph breaks
+    paragraphs = [p.strip() for p in escaped.split("\n\n") if p.strip()]
+    body = "\n\n".join(paragraphs)
+
+    tex_source = (
+        r"\documentclass[11pt,letterpaper]{article}" "\n"
+        r"\usepackage[utf8]{inputenc}" "\n"
+        r"\usepackage[T1]{fontenc}" "\n"
+        r"\usepackage[margin=1in]{geometry}" "\n"
+        r"\usepackage{parskip}" "\n"
+        r"\pagestyle{empty}" "\n"
+        r"\begin{document}" "\n\n"
+        f"{body}\n\n"
+        r"\end{document}" "\n"
+    )
+
+    # Write a temp .tex and compile
+    tex_tmp = txt_path.with_suffix(".tex")
+    tex_tmp.write_text(tex_source, encoding="utf-8")
+
+    try:
+        return compile_latex_to_pdf(tex_tmp, output_path or txt_path.with_suffix(".pdf"))
+    finally:
+        # Clean up the temp .tex (keep only the .txt and .pdf)
+        if tex_tmp.exists():
+            tex_tmp.unlink()
+
+
 # ── Public API ───────────────────────────────────────────────────────────
 
 def convert_to_pdf(
-    text_path: Path, output_path: Path | None = None, html_only: bool = False
+    source_path: Path, output_path: Path | None = None, html_only: bool = False
 ) -> Path:
-    """Convert a text resume/cover letter to PDF.
+    """Convert a resume file (.tex or .txt) to PDF.
+
+    For .tex files: compiles via pdflatex (preferred path).
+    For .txt files: parses text, renders via HTML, exports via Playwright (legacy).
 
     Args:
-        text_path: Path to the .txt file to convert.
-        output_path: Optional override for the output path. Defaults to same
-            name with .pdf extension.
-        html_only: If True, output HTML instead of PDF.
+        source_path: Path to the .tex or .txt file to convert.
+        output_path: Optional override for the output path.
+        html_only: If True and source is .txt, output HTML instead of PDF.
 
     Returns:
         Path to the generated PDF (or HTML) file.
     """
-    text_path = Path(text_path)
-    text = text_path.read_text(encoding="utf-8")
+    source_path = Path(source_path)
+
+    # LaTeX path (primary)
+    if source_path.suffix == ".tex":
+        return compile_latex_to_pdf(source_path, output_path)
+
+    # Legacy text path (fallback)
+    text = source_path.read_text(encoding="utf-8")
     resume = parse_resume(text)
     html = build_html(resume)
 
     if html_only:
-        out = output_path or text_path.with_suffix(".html")
+        out = output_path or source_path.with_suffix(".html")
         out = Path(out)
         out.write_text(html, encoding="utf-8")
         log.info("HTML generated: %s", out)
         return out
 
-    out = output_path or text_path.with_suffix(".pdf")
+    out = output_path or source_path.with_suffix(".pdf")
     out = Path(out)
     render_pdf(html, str(out))
     log.info("PDF generated: %s", out)
@@ -391,10 +559,9 @@ def convert_to_pdf(
 
 
 def batch_convert(limit: int = 50) -> int:
-    """Convert .txt files in TAILORED_DIR that don't have corresponding PDFs.
+    """Convert .tex and .txt files in TAILORED_DIR that don't have corresponding PDFs.
 
-    Scans for .txt files (excluding _JOB.txt and _REPORT.json), checks if a
-    .pdf with the same stem already exists, and converts any that are missing.
+    Prefers .tex files (LaTeX compilation). Falls back to .txt (HTML rendering).
 
     Args:
         limit: Maximum number of files to convert.
@@ -406,12 +573,16 @@ def batch_convert(limit: int = 50) -> int:
         log.warning("Tailored directory does not exist: %s", TAILORED_DIR)
         return 0
 
+    # Collect .tex files first (preferred), then .txt as fallback
+    tex_files = sorted(TAILORED_DIR.glob("*.tex"))
     txt_files = sorted(TAILORED_DIR.glob("*.txt"))
-    # Exclude _JOB.txt and _CL.txt files from resume conversion
-    # (they get their own conversion calls)
-    candidates = [
+
+    # Exclude _JOB.txt files
+    candidates: list[Path] = list(tex_files) + [
         f for f in txt_files
         if not f.name.endswith("_JOB.txt")
+        # Skip .txt if a .tex with the same stem exists
+        and not (TAILORED_DIR / f"{f.stem}.tex").exists()
     ]
 
     # Filter to those without a corresponding PDF
@@ -424,7 +595,7 @@ def batch_convert(limit: int = 50) -> int:
             break
 
     if not to_convert:
-        log.info("All text files already have PDFs.")
+        log.info("All files already have PDFs.")
         return 0
 
     log.info("Converting %d files to PDF...", len(to_convert))

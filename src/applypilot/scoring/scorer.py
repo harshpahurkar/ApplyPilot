@@ -7,6 +7,7 @@ profile and resume file.
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -18,6 +19,115 @@ from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
+
+_TITLE_SKIP_RE = re.compile(
+    r"\b(senior|sr\.?|staff|principal|lead|manager|director|architect|head|vp|intern(?:ship)?|co-?op)\b",
+    re.IGNORECASE,
+)
+
+_NON_FULL_TIME_RE = re.compile(
+    r"\b(part[ -]?time|contract(?:or)?|temporary|temp|freelance|seasonal|casual)\b",
+    re.IGNORECASE,
+)
+
+_SOFTWARE_ROLE_KEYWORDS = {
+    "software", "engineer", "developer", "backend", "front-end", "frontend",
+    "full stack", "full-stack", "devops", "platform", "sre", "automation",
+    "qa", "quality assurance", "site reliability", "cloud", "infrastructure",
+    "machine learning", "ml", "ai", "data engineer", "application development",
+}
+
+_CANADA_PATTERNS = (
+    "canada", ", on,", ", on ", ", bc,", ", bc ", ", ab,", ", ab ",
+    ", qc,", ", qc ", ", mb,", ", mb ", ", sk,", ", sk ",
+    ", ns,", ", ns ", ", nb,", ", nb ", ", nl,", ", nl ",
+    ", pe,", ", pe ",
+    "ontario", "quebec", "british columbia", "alberta",
+    "manitoba", "saskatchewan", "nova scotia",
+    "toronto", "montreal", "vancouver", "ottawa", "calgary",
+    "edmonton", "winnipeg", "waterloo", "kitchener", "mississauga",
+    "brampton", "markham", "hamilton", "london, on", "halifax",
+    "victoria, bc", "saskatoon", "regina",
+)
+
+_REMOTE_NON_CANADA_HINTS = (
+    "us only", "usa only", "u.s. only", "united states only", "america only",
+    "remote - us", "remote (us", "us remote", "remote us",
+    "remote - usa", "remote (usa", "remote usa",
+    "remote - united states", "remote (united states",
+    "remote - india", "remote (india", "india only",
+    "remote - uk", "remote (uk", "uk only", "united kingdom only",
+    "remote - europe", "remote (europe", "europe only", "eu only",
+    "emea only", "apac only", "anz only",
+    "remote - australia", "australia only",
+    "remote - new zealand", "new zealand only",
+    "remote - singapore", "singapore only",
+)
+
+
+def _score_commit_every() -> int:
+    """How many scored jobs to buffer before committing updates."""
+    raw = os.environ.get("APPLYPILOT_SCORE_COMMIT_EVERY", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+
+    # In Copilot-backed streaming runs, commit each score so downstream
+    # tailoring can start immediately instead of waiting for batch flushes.
+    copilot_enabled = os.environ.get("APPLYPILOT_USE_COPILOT_LLM", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    return 1 if copilot_enabled else 10
+
+
+def _should_auto_skip_title(title: str) -> bool:
+    """Return True when title is outside target IC/junior-mid range."""
+    enabled = os.environ.get("APPLYPILOT_SCORE_SKIP_TITLES", "1").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not enabled:
+        return False
+    return bool(_TITLE_SKIP_RE.search(title or ""))
+
+
+def _precheck_skip_reason(job: dict) -> str | None:
+    """Return a fast precheck skip reason before calling the LLM."""
+    if os.environ.get("APPLYPILOT_SCORE_PRECHECKS", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+
+    title = str(job.get("title") or "")
+    location = str(job.get("location") or "")
+    description = str(job.get("full_description") or "")
+
+    if _should_auto_skip_title(title):
+        return "title_policy"
+
+    title_l = title.lower()
+    desc_l = description.lower()
+    loc_l = location.lower()
+
+    if os.environ.get("APPLYPILOT_REQUIRE_SOFTWARE_KEYWORDS", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        corpus = f"{title_l}\n{desc_l[:1400]}"
+        if not any(kw in corpus for kw in _SOFTWARE_ROLE_KEYWORDS):
+            return "not_software"
+
+    if os.environ.get("APPLYPILOT_REQUIRE_FULL_TIME", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        if _NON_FULL_TIME_RE.search(title_l):
+            return "not_full_time"
+
+    if not loc_l.strip():
+        return "location_unknown"
+
+    is_remote = any(x in loc_l for x in ("remote", "anywhere", "work from home"))
+    in_canada = any(x in loc_l for x in _CANADA_PATTERNS)
+    if not is_remote and not in_canada:
+        return "location_non_canada"
+    if is_remote and not in_canada and any(x in loc_l for x in _REMOTE_NON_CANADA_HINTS):
+        return "location_remote_non_canada"
+
+    return None
 
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
@@ -152,7 +262,7 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict
     total_errors = 0
     _pending: list[dict] = []
     _lock = threading.Lock()
-    COMMIT_EVERY = 10
+    COMMIT_EVERY = _score_commit_every()
 
     def _flush(pending: list[dict]) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -176,9 +286,21 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 3) -> dict
                 _pending.clear()
 
     def _score_one(job: dict, idx: int) -> tuple[dict, int]:
+        title = job.get("title", "")
+        skip_reason = _precheck_skip_reason(job)
+        if skip_reason:
+            result = {
+                "score": 0,
+                "keywords": "",
+                "reasoning": f"Auto-filtered by precheck policy ({skip_reason}).",
+            }
+            result["url"] = job["url"]
+            result["title"] = title or "?"
+            return result, idx
+
         result = score_job(resume_text, job)
         result["url"] = job["url"]
-        result["title"] = job.get("title", "?")
+        result["title"] = title or "?"
         return result, idx
 
     if workers > 1:

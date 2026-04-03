@@ -85,24 +85,7 @@ def _load_location_filter(search_cfg: dict | None = None):
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-
-    loc = location.lower()
-
-    # Remote is always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    return False
+    return config.location_matches_filter(location, accept, reject, allow_unknown=True)
 
 
 # ---------------------------------------------------------------------------

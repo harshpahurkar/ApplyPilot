@@ -12,8 +12,10 @@ Three-tier extraction cascade (cheapest first):
 
 import json
 import logging
+import os
 import re
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -740,16 +742,25 @@ def _run_detail_scraper(
 
     if workers > 1 and len(order) > 1:
         # Parallel mode: each site batch runs in its own thread with its own
-        # DB connection (conn=None tells scrape_site_batch to create one)
+        # DB connection (conn=None tells scrape_site_batch to create one).
+        # A Semaphore caps concurrent Playwright browsers to prevent resource
+        # exhaustion (each browser is ~200MB RAM).
+        max_browsers = int(os.environ.get("APPLYPILOT_MAX_BROWSERS", str(min(workers, 4))))
+        browser_sem = threading.Semaphore(max_browsers)
+
         def _scrape_site(site: str) -> dict:
-            jobs = site_jobs[site]
-            delay = SITE_DELAYS.get(site, 2.0)
-            log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
-            stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site)
-            log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
-                     site, stats["ok"], stats["partial"], stats["error"],
-                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
-            return stats
+            browser_sem.acquire()
+            try:
+                jobs = site_jobs[site]
+                delay = SITE_DELAYS.get(site, 2.0)
+                log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
+                stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site)
+                log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
+                         site, stats["ok"], stats["partial"], stats["error"],
+                         stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
+                return stats
+            finally:
+                browser_sem.release()
 
         with ThreadPoolExecutor(max_workers=min(workers, len(order))) as pool:
             futures = {pool.submit(_scrape_site, site): site for site in order}

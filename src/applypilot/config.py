@@ -2,7 +2,10 @@
 
 import os
 import platform
+import re
 import shutil
+import threading
+import time
 from pathlib import Path
 
 # User data directory — all user-specific files live here
@@ -91,35 +94,100 @@ def ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# TTL file cache — avoids reading the same YAML/JSON hundreds of times
+# ---------------------------------------------------------------------------
+
+class _FileCache:
+    """Thread-safe TTL cache for config files loaded from disk."""
+
+    def __init__(self, ttl: float = 30.0):
+        self._ttl = ttl
+        self._cache: dict[str, tuple[float, float, object]] = {}  # path -> (mtime, loaded_at, data)
+        self._lock = threading.Lock()
+
+    def get(self, path: Path, loader: callable) -> object:
+        """Return cached data if file hasn't changed and TTL hasn't expired."""
+        key = str(path)
+        now = time.time()
+
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                cached_mtime, loaded_at, data = entry
+                if now - loaded_at < self._ttl:
+                    # Check mtime only if TTL not expired
+                    try:
+                        current_mtime = path.stat().st_mtime if path.exists() else 0
+                    except OSError:
+                        current_mtime = 0
+                    if current_mtime == cached_mtime:
+                        return data
+
+        # Cache miss or expired — reload
+        data = loader()
+        try:
+            mtime = path.stat().st_mtime if path.exists() else 0
+        except OSError:
+            mtime = 0
+
+        with self._lock:
+            self._cache[key] = (mtime, now, data)
+        return data
+
+    def invalidate(self, path: Path | None = None) -> None:
+        """Clear cache for a specific path or all entries."""
+        with self._lock:
+            if path is None:
+                self._cache.clear()
+            else:
+                self._cache.pop(str(path), None)
+
+
+_config_cache = _FileCache(ttl=30.0)
+
+
+def invalidate_config_cache() -> None:
+    """Force all config files to be re-read on next access."""
+    _config_cache.invalidate()
+
+
 def load_profile() -> dict:
-    """Load user profile from ~/.applypilot/profile.json."""
+    """Load user profile from ~/.applypilot/profile.json (cached with TTL)."""
     import json
     if not PROFILE_PATH.exists():
         raise FileNotFoundError(
             f"Profile not found at {PROFILE_PATH}. Run `applypilot init` first."
         )
-    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    return _config_cache.get(PROFILE_PATH, lambda: json.loads(PROFILE_PATH.read_text(encoding="utf-8")))
 
 
 def load_search_config() -> dict:
-    """Load search configuration from ~/.applypilot/searches.yaml."""
+    """Load search configuration from ~/.applypilot/searches.yaml (cached with TTL)."""
     import yaml
-    if not SEARCH_CONFIG_PATH.exists():
-        # Fall back to package-shipped example
-        example = CONFIG_DIR / "searches.example.yaml"
-        if example.exists():
-            return yaml.safe_load(example.read_text(encoding="utf-8"))
-        return {}
-    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    def _load():
+        if not SEARCH_CONFIG_PATH.exists():
+            example = CONFIG_DIR / "searches.example.yaml"
+            if example.exists():
+                return yaml.safe_load(example.read_text(encoding="utf-8"))
+            return {}
+        return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    return _config_cache.get(SEARCH_CONFIG_PATH, _load)
 
 
 def load_sites_config() -> dict:
-    """Load sites.yaml configuration (sites list, manual_ats, blocked, etc.)."""
+    """Load sites.yaml configuration (cached with TTL)."""
     import yaml
     path = CONFIG_DIR / "sites.yaml"
-    if not path.exists():
-        return {}
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    def _load():
+        if not path.exists():
+            return {}
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    return _config_cache.get(path, _load)
 
 
 def is_manual_ats(url: str | None) -> bool:
@@ -155,6 +223,57 @@ def load_base_urls() -> dict[str, str | None]:
     """Load site base URLs for URL resolution from sites.yaml."""
     cfg = load_sites_config()
     return cfg.get("base_urls", {})
+
+
+# ---------------------------------------------------------------------------
+# Location filtering helpers (shared across discovery modules)
+# ---------------------------------------------------------------------------
+
+_REMOTE_LOCATION_HINTS = ("remote", "anywhere", "work from home", "wfh", "distributed")
+
+
+def _location_pattern_match(location_text: str, pattern: str) -> bool:
+    """Match a configured location pattern against normalized location text.
+
+    Short alpha-only patterns (for example `ON`, `BC`, `US`) use strict
+    token boundaries so they don't match inside unrelated words like
+    "locations" or "business".
+    """
+    token = re.sub(r"\s+", " ", str(pattern or "").strip().lower())
+    if not token:
+        return False
+
+    if len(token) <= 3 and token.isalpha():
+        return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", location_text) is not None
+
+    return token in location_text
+
+
+def location_matches_filter(
+    location: str | None,
+    accept: list[str],
+    reject: list[str],
+    *,
+    allow_unknown: bool = True,
+) -> bool:
+    """Return True when a location string passes accept/reject filtering."""
+    if not location:
+        return allow_unknown
+
+    loc = re.sub(r"\s+", " ", location.lower()).strip()
+
+    if any(hint in loc for hint in _REMOTE_LOCATION_HINTS):
+        return True
+
+    for pattern in reject:
+        if _location_pattern_match(loc, str(pattern)):
+            return False
+
+    for pattern in accept:
+        if _location_pattern_match(loc, str(pattern)):
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------

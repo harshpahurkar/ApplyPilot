@@ -13,8 +13,10 @@ import json
 import logging
 import os
 import re
+import hashlib
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,11 +24,13 @@ from pathlib import Path
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.scoring.pdf import validate_tex_quality
 from applypilot.scoring.validator import (
     FABRICATION_WATCHLIST,
     _extract_jd_keywords,
     sanitize_text,
     validate_ats_compliance,
+    validate_ats_rendered_text,
     validate_json_fields,
     validate_tailored_resume,
 )
@@ -64,13 +68,43 @@ def _build_tailor_prompt(profile: dict) -> str:
     companies_str = ", ".join(companies) if companies else "N/A"
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
+    # Real projects the candidate has built (use as starting points, adapt to JD)
+    real_projects = resume_facts.get("preserved_projects", [])
+    if real_projects:
+        projects_block = "\n".join(
+            f"- {p['name']} ({p.get('tech', 'N/A')}): {'; '.join(p.get('bullets', [p.get('description', '')]))}"
+            for p in real_projects if isinstance(p, dict)
+        )
+    else:
+        projects_block = "N/A"
+
+    # Real experience with full bullets for the LLM to reference
+    real_experience = resume_facts.get("preserved_experience", [])
+    if real_experience:
+        exp_block = "\n".join(
+            f"- {e['title']} at {e['company']} ({e.get('dates', '')}): {'; '.join(e.get('bullets', []))}"
+            for e in real_experience if isinstance(e, dict)
+        )
+    else:
+        exp_block = "N/A"
+
     education = profile.get("experience", {})
     education_level = education.get("education_level", "")
 
-    return f"""You are an elite ATS optimization engine. Your SOLE mission: get this person past EVERY ATS filter and into an interview. You follow a strict 4-step system. Do NOT deviate. Every resume you produce MUST score 9+/10 on ATS compatibility.
+    # Preserved education
+    pres_edu = resume_facts.get("preserved_education", {})
+    edu_degree = pres_edu.get("degree") or education_level or "Bachelor's Degree"
+    edu_dates = pres_edu.get("dates") or "Sept 2021 -- April 2025"
+    edu_school = pres_edu.get("school") or school or "University"
 
-## STEP 1: MANDATORY KEYWORD EXTRACTION (most critical step)
-Before writing ANYTHING, extract EVERY requirement from the JD:
+    return f"""You are an elite ATS optimization engine. Your SOLE mission: get this person past EVERY ATS filter and into an interview.
+
+CRITICAL OUTPUT RULE: You MUST return ONLY a single JSON object with keys: "title", "education", "experience", "projects", "skills". NO other keys. NO intermediate analysis. NO keyword extraction objects. NO step-by-step output. Just the final resume JSON.
+
+You follow a strict 4-step INTERNAL process. Do these steps MENTALLY -- do NOT include them in your output. Your output is ONLY the final resume JSON.
+
+## INTERNAL STEP 1: KEYWORD EXTRACTION (do this in your head, do NOT output it)
+Mentally extract EVERY requirement from the JD:
 
 A) LIST every tool, language, framework, platform, methodology mentioned in the JD.
 B) LIST every process/soft-skill term (test plans, code reviews, defect reporting, agile, scrum, etc.).
@@ -82,11 +116,17 @@ G) If the JD mentions a testing methodology (manual testing, regression testing,
 H) EVERY tool/framework/language explicitly named in the JD MUST appear in the Technical Skills section (not just in bullets). If the JD says "AWS", AWS must be in Developer Tools. If the JD says "Cucumber", Cucumber must be in Frameworks or Developer Tools. If the JD says "Selenium and Cucumber", BOTH must appear. Do NOT skip any tool that the JD names by name.
 I) FINAL TOOL CHECK: Re-read the JD one more time. Circle every proper noun that is a technology. Verify EACH ONE is in your Technical Skills section. If you missed even one, add it NOW. This is the #1 reason resumes get ATS-rejected.
 
+J) ACRONYM EXPANSION: For common acronyms in the JD (CI/CD, REST, OOP, TDD, BDD, API, SaaS, etc.), include BOTH the acronym AND the full form at least once in the resume. ATS like Lever struggles with acronyms alone. Example: write "CI/CD (Continuous Integration/Continuous Deployment)" once, then "CI/CD" thereafter.
+K) KEYWORD FREQUENCY: The JD's top 5 most-mentioned keywords MUST each appear at least 2-3 times across Technical Skills, experience bullets, project bullets, and skills_used fields. Some ATS determines skill strength by repetition count.
+L) SKILL PLACEMENT FOR EXPERIENCE CREDIT: JD "required" skills MUST appear inside experience bullets or experience skills_used, not only in the Technical Skills section. Some ATS assigns years-of-experience credit based on which job entry a skill appears in. A skill only in the standalone skills section gets tagged as "a few months" experience.
+M) SOFT SKILLS FROM JD: If the JD mentions soft-skill phrases (collaboration, team leadership, cross-functional, stakeholder communication, mentoring, etc.), weave the top 3 most-mentioned ones NATURALLY into experience bullets. Modern ATS uses NLP to detect these from context.
+N) COURSEWORK ADAPTATION: Rewrite the coursework field to include course names that echo JD keywords, but ONLY courses a Software Development program would realistically offer (e.g., "Data Structures", "Cloud Computing", "Software Engineering", "Database Systems", "Operating Systems", "Machine Learning", "Web Development", "DevOps Practices", "Algorithms"). Do NOT invent courses about niche technologies like mainframe systems, z/OS, or other specialized platforms the candidate hasn't studied. Keep coursework as a comma-separated string, NOT a list.
+
 Count your keyword coverage. If you cannot hit 90%+ of JD technical requirements in your output, you are FAILING. Go back and add them.
 
 This step is NON-NEGOTIABLE. A resume missing JD keywords = auto-rejected by ATS = you failed.
 
-## STEP 2: REWRITE EXPERIENCE WITH ATS-OPTIMIZED LANGUAGE
+## INTERNAL STEP 2: REWRITE EXPERIENCE (apply these rules mentally, output only the final JSON)
 
 BULLET FORMULA (mandatory for EVERY SINGLE bullet in experience AND projects, no exceptions):
 
@@ -138,7 +178,7 @@ CRITICAL BULLET QUALITY RULES (violating ANY of these = resume rejected):
 - NEVER END A BULLET WITH A TECH LIST. "...using Python, React, AWS, Docker" is WRONG. The skills_used field handles tech listing. Bullets must END with measurable business impact ("resulting in 40% faster deploys"), NOT a grocery list of tools. If you catch yourself listing tools at the end, delete them and add an impact metric instead.
 - EVERY BULLET MUST CONTAIN AT LEAST ONE SPECIFIC NUMBER. "Improved performance" is vague garbage. "Improved response time by 40% for 50K daily users" is real. Acceptable metrics: percentages (40%), counts (200+ endpoints), dollar amounts ($500K), timeframes (2 weeks to 3 days), team sizes (12 engineers). If a bullet has zero numbers, it is INVALID -- rewrite it with a concrete metric.
 
-## STEP 3: MANDATORY PRE-OUTPUT VERIFICATION (do NOT skip this)
+## INTERNAL STEP 3: PRE-OUTPUT VERIFICATION (verify mentally before outputting JSON)
 Before outputting your JSON, perform this checklist:
 
 1. List every technical skill/tool from the JD.
@@ -156,10 +196,14 @@ Before outputting your JSON, perform this checklist:
 12. COUNT CHARACTERS in every bullet. If ANY bullet exceeds 130 characters, shorten it. Bullets that overflow onto a 2nd line by 1-2 words waste space and look sloppy.
 13. Check: does ANY bullet END with a comma-separated list of technologies? If so, MOVE those tools to skills_used and replace the ending with a measurable impact metric.
 14. Check: does EVERY bullet contain at least one specific number (percentage, count, dollar amount, timeframe)? If any bullet has zero numbers, rewrite it with a concrete metric. "Improved performance" = FAIL. "Improved performance by 40%" = PASS.
+15. KEYWORD FREQUENCY CHECK: Do the JD's top 5 most-mentioned skills each appear at least 2-3 times total across your output? If not, add them to more skills_used fields or bullets.
+16. SKILL PLACEMENT CHECK: Are the JD's "required" skills placed inside experience entries (bullets or skills_used), not ONLY in the standalone Technical Skills section? Skills only in Technical Skills get tagged as "a few months" experience by some ATS.
+17. ACRONYM CHECK: For any acronym in Technical Skills (CI/CD, REST, API, OOP, TDD, BDD, SaaS, etc.), verify the full form appears at least once somewhere in the resume (experience bullet, project bullet, or coursework).
+18. ANTI-GENERIC CHECK: Every bullet must reference a SPECIFIC tool, system, or metric. Generic statements without specifics are flagged as AI-generated content by 28% of hiring managers. Remove any bullet that could apply to any job at any company.
 
-DO NOT OUTPUT until ALL 14 checks pass. If you skip this step, the resume WILL fail ATS.
+DO NOT OUTPUT until ALL 18 checks pass mentally. If you skip this step, the resume WILL fail ATS. Remember: your output is ONLY the final resume JSON — never output your analysis or keyword lists.
 
-## STEP 4: STRUCTURE FOR JAKE'S RESUME TEMPLATE
+## STEP 4: OUTPUT STRUCTURE (this is the ONLY thing you output)
 The output will be rendered into Jake's Resume LaTeX template. Follow this exact section order:
 1. Education (school, degree, coursework relevant to the JD)
 2. Experience (each entry MUST include a skills_used field at the end)
@@ -170,15 +214,18 @@ Must fit 1 page (max 3-4 experience entries with 3-4 bullets each, 2-3 projects 
 ## SKILLS BOUNDARY (core stack):
 {skills_block}
 
-CRITICAL ATS OVERRIDE: If a skill, tool, language, or framework appears ANYWHERE in the JD, it MUST appear in your output -- period. The boundary above defines the candidate's CORE stack, but for maximum ATS score:
-- ANY tool/language/framework from the JD is ALLOWED in Technical Skills, project bullets, AND project skills_used.
-- Experience skills_used fields should include JD tools wherever the work is plausible (if the candidate used Python and the JD says Go, include Go alongside Python in skills_used).
-- Projects are FULLY fabricated to demonstrate JD skills -- use ANY tool the JD requires.
-- Common industry tools (Jira, Confluence, Postman, Docker, Kubernetes, Terraform, AWS, Azure, GCP, CI/CD tools, testing frameworks, etc.) are ALWAYS allowed everywhere.
-- The goal is 95%+ JD keyword coverage. Missing a single JD keyword is an ATS rejection risk.
+ATS KEYWORD STRATEGY:
+- EXPERIENCE: Use only skills from the boundary and common industry tools. Do NOT claim experience with technologies the candidate hasn't used.
+- PROJECTS: Projects are the candidate's ATS keyword weapon. Projects CAN use ANY tool/framework/language from the JD because the candidate will build them before interviewing. This is how you close skill gaps.
+- SKILLS SECTION: Include everything from the boundary PLUS any JD tools that appear in your project entries.
+- Common industry tools (Jira, Confluence, Postman, Docker, Kubernetes, AWS, Azure, CI/CD tools, testing frameworks, Agile, Scrum, etc.) are always allowed everywhere.
+- The goal is 95%+ JD keyword coverage. Projects are how you get there.
 
 ## EXPERIENCE RULES:
+- The candidate's REAL experience (use these as the BASE for rewriting -- you may rephrase but NOT invent new companies or roles):
+{exp_block}
 - Provide company, location, title, dates, bullets, and skills_used for each entry.
+- Rewrite the REAL bullets above to match JD language and incorporate JD keywords, but keep the core achievements truthful.
 - skills_used: comma-separated list of 8-12 key technologies/skills for that role. MUST include JD-mentioned tools. If the JD mentions a tool and the role could have plausibly used it, ADD IT.
 - Reorder experience entries to put the most relevant for the JD first.
 - DROP "Code Ninjas Markham" unless the JD is specifically about teaching or education. Use the saved space for more relevant content (extra project or more bullets).
@@ -187,28 +234,42 @@ CRITICAL ATS OVERRIDE: If a skill, tool, language, or framework appears ANYWHERE
 - Rewrite bullets aggressively to incorporate JD language. If the JD says "microservices" and the candidate built APIs, reframe as microservices. If the JD says "cloud-native" and the candidate deployed to servers, reframe as cloud deployment.
 - EXPERIENCE TITLES MUST STAY TRUE TO THE ORIGINAL for background check compliance. Use EXACTLY: "Software/Automation Developer" for Ministry of Children, Community and Social Services, and "Software Developer" for Affimintus Technologies. You MAY append a parenthetical clarifier to help ATS matching (e.g., "Software Developer (Backend)" or "Software/Automation Developer (QA/DevOps)"), but the base title MUST remain unchanged. Company names MUST stay real.
 
-## PROJECT RULES (your ATS keyword weapon):
-- Projects MUST be fabricated from scratch to perfectly match the JD. Do NOT reuse generic projects.
-- For each project, provide name, tech_stack, dates, bullets, and skills_used.
-- skills_used: comma-separated list rendered as a bullet in the project section.
-- EVERY JD skill gap not covered by experience MUST be demonstrated in projects. No exceptions.
-- Use the EXACT tools, frameworks, and languages from the JD in project tech stacks.
-- Project names should sound like real engineering work that directly solves problems the JD describes.
-- 2-3 bullets per project, each following the ATS bullet formula.
-- Include 2-3 projects. Each project should target DIFFERENT JD requirements to maximize keyword spread.
-- If the JD mentions cloud (AWS/Azure/GCP), one project MUST be cloud-native with specific services (Lambda, ECS, S3, EC2, etc.).
-- If the JD mentions DevOps/CI-CD, one project MUST demonstrate pipeline work with the specific tools from the JD.
+## PROJECT RULES (your primary ATS keyword weapon):
+- The candidate's existing projects for reference:
+{projects_block}
+- INVENT 2-3 new projects specifically designed to demonstrate JD requirements. The candidate will build these before interviewing.
+- Study this writing style carefully from the candidate's REAL projects:
+  EXAMPLE 1: "Fragments Microservice | Node.js, AWS, Docker, PostgreSQL"
+    - "Achieved 98% code coverage with 120+ automated tests by implementing a cloud-native REST microservice handling 100+ daily requests"
+    - "Containerized application with Docker and deployed on AWS ECS, ensuring reliable performance and scalability"
+    - "Automated CI/CD pipeline using GitHub Actions, streamlining deployment processes and enhancing team productivity"
+  EXAMPLE 2: "Housify - AI Real Estate Platform | TensorFlow, Solidity, Hardhat, React"
+    - "Achieved 94% accuracy on 1K+ Toronto listings by developing a machine learning property valuation model using TensorFlow"
+    - "Built Ethereum smart contracts using Solidity and Hardhat, ensuring secure and efficient transactions"
+    - "Implemented Web3.js integration for cryptocurrency payments and NFT-based property ownership transfers"
+- MATCH THIS STYLE EXACTLY:
+  1. Project names are CREATIVE and SPECIFIC (not "Enterprise Task Manager" or "Cloud Platform"). Use the pattern: "[Catchy Name] - [What It Does]" or just a specific product name like "Fragments Microservice".
+  2. tech_stack in header = EXACTLY 4 technologies, comma-separated. Pick the 4 MOST JD-relevant.
+  3. Exactly 3 bullets per project. Each bullet describes a CONCRETE technical thing that was built, not a vague claim.
+  4. Bullets describe WHAT was built with SPECIFIC details (e.g., "cloud-native REST microservice handling 100+ daily requests", "ML property valuation model"). NOT "developed scalable applications".
+  5. Each bullet STARTS with a strong verb and weaves in specific JD tools naturally.
+  6. skills_used line lists 6-10 specific tools used in that project.
+- Each project tech_stack MUST contain specific technologies FROM THE JD.
+- Each project MUST target DIFFERENT JD requirements to maximize keyword spread across projects.
+- If the JD mentions cloud (AWS/Azure/GCP), one project MUST be cloud-native with specific services (Lambda, ECS, S3, etc.).
+- If the JD mentions DevOps/CI-CD, one project MUST demonstrate pipeline work with the JD's specific tools.
 - If the JD mentions a specific framework (Django, Spring, .NET, Rails, etc.), one project MUST use that exact framework.
-- The candidate will build these projects before the interview. They are NOT fake -- they are planned work. Go all-in.
+- If the JD mentions testing (Selenium, JMeter, Cucumber, etc.), one project MUST be a test automation suite.
+- Use the EXACT tool names from the JD in project tech stacks and bullets.
 
-## SKILLS SECTION (this section is your ATS keyword goldmine):
-- MUST include EVERY tool, language, framework, and platform mentioned in the JD. No boundary restriction here -- if the JD says it, it goes in Technical Skills.
-- If the JD mentions Jira, Postman, JMeter, LoadRunner, SoapUI, Confluence, TestNG, Cucumber, TestRail, or similar standard tools, ADD THEM to the appropriate category.
-- If the JD mentions AWS, Azure, GCP -- they MUST appear in Developer Tools. Do NOT leave cloud platforms only in project descriptions.
-- Reorder each category so JD must-haves appear FIRST (the most important keywords should be the first items listed).
+## SKILLS SECTION (ATS keyword goldmine):
+- MUST include every tool/language/framework that appears in your experience or project entries.
+- If the JD mentions a tool and you used it in a project, it MUST also appear in Technical Skills.
+- Reorder each category so JD-relevant skills appear FIRST.
+- Common industry tools (Jira, Confluence, Postman, Selenium, Cucumber, TestNG, JMeter, SoapUI, LoadRunner, TestRail, Terraform, Ansible, etc.) may be added if the JD mentions them.
 - Use these category names: Languages, Frameworks, Developer Tools, Databases and Libraries.
-- Developer Tools is the catch-all for: CI/CD tools, testing tools (Selenium, Cucumber, JMeter, TestNG), DevOps tools, project management tools (Jira, Confluence), API testing tools (Postman, SoapUI), cloud platforms (AWS, Azure).
-- CROSS-CHECK: Go back to the JD. List every technical term. Verify each one appears in this section. If any is missing, ADD IT NOW.
+- Developer Tools is the catch-all for: CI/CD tools, testing tools, DevOps tools, project management tools, API testing tools, cloud platforms.
+- CROSS-CHECK: Re-read the JD one more time. Every proper noun that is a technology MUST appear in Technical Skills. This is the #1 reason resumes get ATS-rejected.
 
 ## VOICE:
 - Write like a real engineer. Short, direct, results-focused.
@@ -226,13 +287,13 @@ CRITICAL ATS OVERRIDE: If a skill, tool, language, or framework appears ANYWHERE
 - Must fit 1 page
 - Every bullet MUST follow the formula with all 3 parts: result + action + impact
 - 95%+ of JD technical keywords MUST appear somewhere in your output (Technical Skills, experience, or projects)
-- ANY skill/tool/framework from the JD is allowed in Technical Skills and projects, even if outside the skills boundary
+- Experience uses ONLY skills from the boundary. Projects can use ANY JD tool.
 - The ONLY things you cannot fabricate: company names, degrees, certifications, and experience metrics
-- If you cannot hit 95% keyword coverage, add another project to fill the gaps
+- If you cannot hit 95% keyword coverage, add a 3rd project to fill the gaps
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No preamble.
 
-{{"title":"Exact Role Title from JD","education":{{"school":"{school}","location":"Toronto, ON","degree":"{education_level}","dates":"Sept 2018 -- April 2022","coursework":"Relevant Course 1, Relevant Course 2"}},"experience":[{{"company":"Company Name","location":"City, Province","title":"Job Title","dates":"Month Year -- Month Year","bullets":["Achieved X by Y resulting in Z","bullet 2","bullet 3"],"skills_used":"React, Node.js, AWS, PostgreSQL, Jira, Postman"}}],"projects":[{{"name":"Project Name","tech_stack":"Python, Flask, Docker","dates":"Month Year -- Month Year","bullets":["Achieved X by Y resulting in Z","bullet 2"],"skills_used":"Python, Flask, Docker"}}],"skills":{{"Languages":"Python, JavaScript, TypeScript","Frameworks":"React, Node.js, Flask","Developer Tools":"Git, Docker, Jenkins, Jira, Postman, AWS","Databases and Libraries":"PostgreSQL, MongoDB, Redis"}}}}"""
+{{"title":"Exact Role Title from JD","education":{{"school":"{edu_school}","location":"Toronto, ON","degree":"{edu_degree}","dates":"{edu_dates}","coursework":"Relevant Course 1, Relevant Course 2"}},"experience":[{{"company":"Company Name","location":"City, Province","title":"Job Title","dates":"Month Year -- Month Year","bullets":["Achieved X by Y resulting in Z","bullet 2","bullet 3"],"skills_used":"React, Node.js, AWS, PostgreSQL, Jira, Postman"}}],"projects":[{{"name":"Project Name","tech_stack":"Python, Flask, Docker","dates":"Month Year -- Month Year","bullets":["Achieved X by Y resulting in Z","bullet 2"],"skills_used":"Python, Flask, Docker"}}],"skills":{{"Languages":"Python, JavaScript, TypeScript","Frameworks":"React, Node.js, Flask","Developer Tools":"Git, Docker, Jenkins, Jira, Postman, AWS","Databases and Libraries":"PostgreSQL, MongoDB, Redis"}}}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -341,7 +402,17 @@ def extract_json(raw: str) -> dict:
     end = raw.rfind("}")
     if start != -1 and end > start:
         try:
-            return json.loads(raw[start:end + 1])
+            data = json.loads(raw[start:end + 1])
+            # If the LLM returned analysis keys instead of resume keys,
+            # look for a nested key that contains the actual resume.
+            _RESUME_KEYS = {"experience", "projects", "skills", "education"}
+            if not (_RESUME_KEYS & set(data.keys())):
+                # Try to find the resume nested inside a wrapper key
+                for key, val in data.items():
+                    if isinstance(val, dict) and (_RESUME_KEYS & set(val.keys())):
+                        log.info("Unwrapped resume JSON from nested key '%s'", key)
+                        return val
+            return data
         except json.JSONDecodeError:
             pass
 
@@ -392,6 +463,44 @@ def _pretty_keyword(token: str) -> str:
     return t.title()
 
 
+def _looks_like_technical_keyword(token: str) -> bool:
+    """Heuristic guardrail to avoid injecting noisy non-skill JD tokens."""
+    t = (token or "").strip().lower()
+    if not t:
+        return False
+    if len(t) < 2 or len(t) > 36:
+        return False
+
+    blocked = {
+        "overview", "provided", "none", "yes", "no", "required", "preferred",
+        "planyes", "providednone", "typeexperienced", "overviewemergency",
+        "main", "sw", "dw", "eeo", "bs", "b.s", "requirementsnone",
+    }
+    if t in blocked:
+        return False
+    if t.startswith(("http", "www")):
+        return False
+
+    tech_markers = (
+        "api", "sql", "aws", "azure", "gcp", "docker", "kubernetes", "terraform",
+        "react", "node", "spring", "django", "flask", "fastapi", "java", "python",
+        "golang", "rust", "typescript", "javascript", "spark", "kafka", "airflow",
+        "etl", "ci/cd", "devops", "git", "postgres", "mysql", "mongodb", "redis",
+        "databricks", "tensorflow", "pytorch", "selenium", "cucumber", "junit",
+        "postman", "jira", "confluence", "linux", "cloud", "ml", "ai",
+    )
+    if any(marker in t for marker in tech_markers):
+        return True
+
+    # Keep common compact acronyms and short stack tokens.
+    if re.fullmatch(r"[a-z]{2,6}", t):
+        return t in {"api", "sdk", "sql", "aws", "gcp", "etl", "ml", "ai", "qa", "ui", "ux"}
+    if re.fullmatch(r"[a-z0-9.+#/-]{2,18}", t) and ("/" in t or "+" in t or "#" in t or "." in t):
+        return True
+
+    return False
+
+
 def _default_resume_bullets(skill_hint: str) -> list[str]:
     """Short, formula-compliant fallback bullets."""
     core_items = _split_csv(skill_hint)[:2]
@@ -408,33 +517,128 @@ def _default_resume_bullets(skill_hint: str) -> list[str]:
     ]
 
 
-def _normalize_bullets(raw_bullets: object, skill_hint: str) -> list[str]:
+def _normalize_bullets(raw_bullets: object, skill_hint: str, min_count: int = 3) -> list[str]:
     defaults = _default_resume_bullets(skill_hint)
     in_bullets = raw_bullets if isinstance(raw_bullets, list) else []
     out: list[str] = []
     for idx, bullet in enumerate(in_bullets[:4]):
         text = sanitize_text(str(bullet)).strip()
-        b_lower = text.lower()
-        is_valid = (
-            bool(re.search(r"\d", text))
-            and " by " in b_lower
-            and "resulting in" in b_lower
-            and len(text) <= 135
-        )
-        out.append(text if is_valid else defaults[idx % len(defaults)])
+        if not text or len(text) < 20:
+            out.append(defaults[idx % len(defaults)])
+            continue
+        text = _strip_banned_words(text)
+        # Truncate overlong bullets instead of replacing them entirely
+        if len(text) > 130:
+            text = text[:127].rsplit(" ", 1)[0] + "..."
+        out.append(text)
 
-    while len(out) < 3:
+    while len(out) < min_count:
         out.append(defaults[len(out) % len(defaults)])
     return out[:4]
 
 
-def _preferred_title_for_company(company: str, fallback: str) -> str:
+_BANNED_WORDS = [
+    "passionate", "dedicated", "leveraging", "robust", "cutting-edge",
+    "proven track record", "eager", "stakeholders", "synergy", "seamless",
+    "seamlessly", "end-to-end", "detail-oriented", "results-driven",
+    "strong track record", "I am confident", "I believe", "I am excited",
+]
+
+
+def _strip_banned_words(text: str) -> str:
+    """Remove banned buzzwords from bullet text."""
+    import re
+    for word in _BANNED_WORDS:
+        # Replace word (case-insensitive) plus any trailing space
+        text = re.sub(r'\b' + re.escape(word) + r'\b\s*', '', text, flags=re.IGNORECASE)
+    # Clean up double spaces and leading/trailing whitespace
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
+
+def _preferred_title_for_company(company: str, llm_title: str) -> str:
+    """Return the real base title, optionally with an LLM-suggested parenthetical.
+
+    Base titles are immutable for background-check compliance.
+    The LLM may suggest a clarifier like "(Backend API)" or "(QA/DevOps)"
+    which gets appended in parentheses if it adds ATS value.
+    """
+    _BASE_TITLES: dict[str, str] = {
+        "ministry of children, community and social services": "Software/Automation Developer",
+        "affimintus technologies": "Software Developer",
+    }
     company_l = (company or "").lower()
-    if "ministry of children, community and social services" in company_l:
-        return "Software/Automation Developer"
-    if "affimintus technologies" in company_l:
-        return "Software Developer"
-    return fallback or "Software Developer"
+    base = None
+    for key, title in _BASE_TITLES.items():
+        if key in company_l:
+            base = title
+            break
+    if base is None:
+        return llm_title or "Software Developer"
+
+    # Extract parenthetical from LLM title if present, e.g. "Java Developer (Backend API)" → "Backend API"
+    llm_clean = (llm_title or "").strip()
+    clarifier = ""
+    import re as _re
+    paren_match = _re.search(r"\(([^)]{3,40})\)\s*$", llm_clean)
+    if paren_match:
+        clarifier = paren_match.group(1).strip()
+    else:
+        # If LLM gave a different title entirely (e.g. "Backend Java Developer"),
+        # extract a short qualifier by removing the base title words
+        base_words = set(base.lower().replace("/", " ").split())
+        llm_words = [w for w in llm_clean.split() if w.lower() not in base_words and len(w) > 1]
+        # Only use if it's short and looks like a qualifier (1-3 words)
+        if 1 <= len(llm_words) <= 3:
+            candidate = " ".join(llm_words)
+            # Skip if it's just generic noise
+            if candidate.lower() not in {"developer", "engineer", "intern", "senior", "junior", "software"}:
+                clarifier = candidate
+
+    if clarifier:
+        return f"{base} ({clarifier})"
+    return base
+
+
+# Common industry tools/processes any developer could reasonably know
+_COMMON_TOOLS_WHITELIST = {
+    "jira", "confluence", "postman", "soapui", "swagger", "agile", "scrum",
+    "tdd", "bdd", "linux", "rest", "restful apis", "rest api", "api", "oop",
+    "sdlc", "manual testing", "regression testing", "performance testing",
+    "code reviews", "terraform", "ansible", "slack", "test plans", "test cases",
+    "defect tracking", "defect reporting", "incident management", "ci/cd",
+    "ci/cd (continuous integration/continuous deployment)", "automated testing",
+    "test automation", "cross-functional", "documentation", "monitoring",
+    "troubleshooting", "process documentation", "defect prevention",
+    "defect detection", "knowledge transfer",
+}
+
+
+def _build_skills_whitelist(profile: dict) -> set[str]:
+    """Build a lowercase set of all skills the candidate actually knows."""
+    boundary = profile.get("skills_boundary", {})
+    known: set[str] = set()
+    for vals in boundary.values():
+        if isinstance(vals, list):
+            known.update(v.lower().strip() for v in vals)
+    resume_facts = profile.get("resume_facts", {})
+    for pe in resume_facts.get("preserved_experience", []):
+        if isinstance(pe, dict):
+            for t in _split_csv(_csv_from_value(pe.get("skills_used") or pe.get("skills") or "")):
+                known.add(t.lower().strip())
+    for pp in resume_facts.get("preserved_projects", []):
+        if isinstance(pp, dict):
+            for t in _split_csv(_csv_from_value(pp.get("tech") or pp.get("tech_stack") or "")):
+                known.add(t.lower().strip())
+    known.update(_COMMON_TOOLS_WHITELIST)
+    return known
+
+
+def _filter_skills_used(skills_csv: str, whitelist: set[str]) -> str:
+    """Filter a comma-separated skills string to only include whitelisted skills."""
+    items = _split_csv(skills_csv)
+    filtered = [s for s in items if s.lower().strip() in whitelist]
+    return ", ".join(_dedupe_keep_order(filtered))
 
 
 def _coerce_skills(data: dict, profile: dict, jd_text: str) -> dict:
@@ -462,7 +666,15 @@ def _coerce_skills(data: dict, profile: dict, jd_text: str) -> dict:
         else:
             mapped["Developer Tools"].extend(values)
 
+    # Build whitelist from boundary + preserved experience/projects
     boundary = profile.get("skills_boundary", {})
+    all_known_lower = _build_skills_whitelist(profile)
+
+    # Filter LLM-generated skills: only keep items in the whitelist
+    for cat in mapped:
+        mapped[cat] = [v for v in mapped[cat] if v.lower().strip() in all_known_lower]
+
+    # Add boundary skills (guaranteed real)
     mapped["Languages"].extend([str(x) for x in boundary.get("languages", [])])
     mapped["Frameworks"].extend([str(x) for x in boundary.get("frameworks", [])])
     mapped["Developer Tools"].extend([str(x) for x in boundary.get("devops", [])])
@@ -470,11 +682,20 @@ def _coerce_skills(data: dict, profile: dict, jd_text: str) -> dict:
     mapped["Databases and Libraries"].extend([str(x) for x in boundary.get("databases", [])])
 
     # Pull a capped set of JD keywords into tools for better ATS coverage.
+    # Only add if they pass the whitelist check.
+    existing_lower = set()
+    for vals in mapped.values():
+        existing_lower.update(v.lower().strip() for v in vals)
     try:
         jd_keywords = sorted(_extract_jd_keywords(jd_text or ""))
     except Exception:
         jd_keywords = []
-    mapped["Developer Tools"].extend(_pretty_keyword(k) for k in jd_keywords[:20])
+    for k in jd_keywords:
+        pk = _pretty_keyword(k)
+        if _looks_like_technical_keyword(k) and pk.lower().strip() not in existing_lower:
+            if pk.lower().strip() in all_known_lower:
+                mapped["Developer Tools"].append(pk)
+                existing_lower.add(pk.lower().strip())
 
     return {
         cat: ", ".join(_dedupe_keep_order(vals))
@@ -482,27 +703,35 @@ def _coerce_skills(data: dict, profile: dict, jd_text: str) -> dict:
     }
 
 
+def _flatten_coursework(value) -> str:
+    """Convert coursework to a clean comma-separated string (handles list or str)."""
+    if isinstance(value, list):
+        return ", ".join(sanitize_text(str(item)) for item in value if item)
+    return str(value)
+
+
 def _coerce_education(data: dict, profile: dict) -> dict:
     raw = data.get("education") if isinstance(data.get("education"), dict) else {}
     facts = profile.get("resume_facts", {})
+    pres = facts.get("preserved_education", {})
     exp = profile.get("experience", {})
 
     return {
-        "school": sanitize_text(str(raw.get("school") or facts.get("preserved_school") or "University")),
-        "location": sanitize_text(str(raw.get("location") or "Toronto, ON")),
-        "degree": sanitize_text(str(raw.get("degree") or exp.get("education_level") or "Bachelor's Degree")),
-        "dates": sanitize_text(str(raw.get("dates") or "")),
-        "coursework": sanitize_text(str(raw.get("coursework") or "Software Engineering, Data Structures, Databases")),
+        "school": sanitize_text(str(pres.get("school") or raw.get("school") or facts.get("preserved_school") or "University")),
+        "location": sanitize_text(str(pres.get("location") or raw.get("location") or "Toronto, ON")),
+        "degree": sanitize_text(str(pres.get("degree") or raw.get("degree") or exp.get("education_level") or "Bachelor's Degree")),
+        "dates": sanitize_text(str(pres.get("dates") or raw.get("dates") or "")),
+        "coursework": sanitize_text(_flatten_coursework(raw.get("coursework") or pres.get("coursework") or "Software Engineering, Data Structures, Databases")),
     }
 
 
 def _coerce_experience(data: dict, profile: dict, skill_hint: str) -> list[dict]:
     raw_entries = data.get("experience") if isinstance(data.get("experience"), list) else []
     preserved = profile.get("resume_facts", {}).get("preserved_companies", [])
+    preserved_experience = profile.get("resume_facts", {}).get("preserved_experience", [])
     required_companies = [c for c in preserved if c and "code ninjas" not in c.lower()]
 
     if not required_companies:
-        # If profile has no preserved companies configured, keep any parsed companies.
         required_companies = [
             sanitize_text(str(e.get("company", ""))).strip()
             for e in raw_entries if isinstance(e, dict) and e.get("company")
@@ -511,15 +740,35 @@ def _coerce_experience(data: dict, profile: dict, skill_hint: str) -> list[dict]
     if not required_companies:
         required_companies = ["Previous Company"]
 
+    # Build lookup from preserved_experience by company name (lowercase)
+    preserved_lookup: dict[str, dict] = {}
+    for pe in preserved_experience:
+        if isinstance(pe, dict) and pe.get("company"):
+            preserved_lookup[pe["company"].lower().strip()] = pe
+
+    # Use LLM entries by index order — the LLM reorders by relevance but often
+    # renames companies. We trust the LLM's BULLETS (they're tailored) but
+    # enforce the real company names/titles from the profile.
     out: list[dict] = []
+    whitelist = _build_skills_whitelist(profile)
     fallback_title = profile.get("experience", {}).get("target_role") or "Software Developer"
     for i, company in enumerate(required_companies[:4]):
+        # Take LLM entry by index (LLM may rename companies but bullet content is tailored)
         src = raw_entries[i] if i < len(raw_entries) and isinstance(raw_entries[i], dict) else {}
+        pres = preserved_lookup.get(company.lower().strip(), {})
+
         title = _preferred_title_for_company(company, sanitize_text(str(src.get("title") or fallback_title)))
-        location = sanitize_text(str(src.get("location") or "Toronto, ON"))
-        dates = sanitize_text(str(src.get("dates") or ""))
-        bullets = _normalize_bullets(src.get("bullets"), skill_hint)
-        skills_used = _csv_from_value(src.get("skills_used")) or skill_hint
+        location = sanitize_text(str(pres.get("location") or src.get("location") or "Toronto, ON"))
+        dates = sanitize_text(str(pres.get("dates") or src.get("dates") or ""))
+
+        # Prefer LLM-rewritten bullets (tailored to JD), fallback to preserved originals
+        llm_bullets = src.get("bullets") if isinstance(src.get("bullets"), list) and len(src.get("bullets", [])) >= 2 else None
+        bullets = _normalize_bullets(llm_bullets or pres.get("bullets"), skill_hint)
+
+        raw_skills_used = _csv_from_value(src.get("skills_used")) or _csv_from_value(pres.get("skills")) or skill_hint
+        skills_used = _filter_skills_used(raw_skills_used, whitelist)
+        if not skills_used:
+            skills_used = skill_hint
 
         out.append({
             "company": company,
@@ -527,47 +776,91 @@ def _coerce_experience(data: dict, profile: dict, skill_hint: str) -> list[dict]
             "title": title,
             "dates": dates,
             "bullets": bullets,
-            "skills_used": ", ".join(_dedupe_keep_order(_split_csv(skills_used))),
+            "skills_used": skills_used,
         })
 
     return out
 
 
-def _coerce_projects(data: dict, skill_hint: str, job_title: str) -> list[dict]:
+def _coerce_projects(data: dict, skill_hint: str, job_title: str, profile: dict | None = None) -> list[dict]:
     raw_projects = data.get("projects") if isinstance(data.get("projects"), list) else []
+    preserved_projects = (profile or {}).get("resume_facts", {}).get("preserved_projects", [])
+    whitelist = _build_skills_whitelist(profile or {})
     out: list[dict] = []
 
+    # LLM fabricates projects to match the JD — names, tech stacks, and skills
+    # can include ANY JD tool (candidate will build before interview).
+    # Guardrails: reject placeholder names, cap tech_stack at 6 items.
     for i, project in enumerate(raw_projects[:3]):
         if not isinstance(project, dict):
             continue
-        name = sanitize_text(str(project.get("name") or f"{job_title} Platform Project {i + 1}"))
-        tech_stack = _csv_from_value(project.get("tech_stack")) or skill_hint
-        dates = sanitize_text(str(project.get("dates") or "2023 -- Present"))
-        bullets = _normalize_bullets(project.get("bullets"), skill_hint)[:3]
-        skills_used = _csv_from_value(project.get("skills_used")) or tech_stack
+        name = sanitize_text(str(project.get("name") or ""))
+        # Reject placeholder-sounding names
+        if not name or "project 1" in name.lower() or "project 2" in name.lower() or "targeted" in name.lower():
+            name = ""
+        tech_stack = _csv_from_value(project.get("tech_stack")) or ""
+        skills_used_raw = _csv_from_value(project.get("skills_used")) or ""
+        if not tech_stack and skills_used_raw:
+            tech_stack = skills_used_raw
+        # Cap tech_stack to 4 items to match original style (no whitelist filtering — projects use ANY JD tool)
+        tech_items = _dedupe_keep_order(_split_csv(tech_stack))[:4]
+        tech_stack = ", ".join(tech_items) if tech_items else ", ".join(_split_csv(skill_hint)[:4])
+        dates = sanitize_text(str(project.get("dates") or "2024 -- Present"))
+        bullets = _normalize_bullets(project.get("bullets"), skill_hint, min_count=3)[:3]
+        # Projects allow ANY JD tool — no whitelist filtering on skills_used
+        raw_su = skills_used_raw or tech_stack
+        skills_used = ", ".join(_dedupe_keep_order(_split_csv(raw_su)))
+        if not skills_used:
+            skills_used = tech_stack
+        if not name:
+            name = _generate_plausible_project_name(tech_items, job_title, i)
         out.append({
             "name": name,
-            "tech_stack": ", ".join(_dedupe_keep_order(_split_csv(tech_stack))),
+            "tech_stack": tech_stack,
             "dates": dates,
             "bullets": bullets,
-            "skills_used": ", ".join(_dedupe_keep_order(_split_csv(skills_used))),
+            "skills_used": skills_used,
         })
 
-    # Ensure at least two projects so the generated resume stays complete.
-    while len(out) < 2:
-        idx = len(out) + 1
-        out.append({
-            "name": f"Targeted {job_title} Project {idx}",
-            "tech_stack": skill_hint,
-            "dates": "2023 -- Present",
-            "bullets": [
-                "Reduced deployment errors by 50% by building automated release checks, resulting in 3x more stable rollouts",
-                "Improved API latency by 38% by adding caching and query tuning, resulting in sub-200ms response times",
-            ],
-            "skills_used": skill_hint,
-        })
+    # Fallback: use preserved_projects if LLM didn't generate enough
+    if len(out) < 2:
+        existing_names_lower = {p["name"].lower().strip() for p in out}
+        for pp in preserved_projects:
+            if len(out) >= 2:
+                break
+            if not isinstance(pp, dict) or not pp.get("name"):
+                continue
+            if pp["name"].lower().strip() in existing_names_lower:
+                continue
+            fb_tech = _csv_from_value(pp.get("tech") or pp.get("tech_stack") or "")
+            fb_skills = _csv_from_value(pp.get("skills") or pp.get("skills_used") or "")
+            tech_items = _dedupe_keep_order(_split_csv(fb_tech or fb_skills))[:6]
+            tech_str = ", ".join(tech_items) if tech_items else ", ".join(_split_csv(skill_hint)[:4])
+            out.append({
+                "name": pp["name"],
+                "tech_stack": tech_str,
+                "dates": pp.get("dates", "2024 -- Present"),
+                "bullets": _normalize_bullets(pp.get("bullets"), skill_hint, min_count=2)[:3],
+                "skills_used": _filter_skills_used(fb_skills or tech_str, whitelist) or tech_str,
+            })
 
     return out[:3]
+
+
+def _generate_plausible_project_name(tech_items: list[str], job_title: str, idx: int) -> str:
+    """Generate a realistic-sounding project name from the tech stack and role."""
+    # Map common tech to project types
+    _PROJECT_TEMPLATES = [
+        "Distributed Task Scheduler",
+        "Real-Time Event Processing Pipeline",
+        "Automated Testing Framework",
+        "Full-Stack E-Commerce Platform",
+        "Cloud Infrastructure Monitor",
+        "API Gateway and Rate Limiter",
+        "Machine Learning Model Server",
+        "Container Orchestration Dashboard",
+    ]
+    return _PROJECT_TEMPLATES[idx % len(_PROJECT_TEMPLATES)]
 
 
 def _coerce_tailor_schema(data: dict, profile: dict, job: dict) -> dict:
@@ -581,11 +874,28 @@ def _coerce_tailor_schema(data: dict, profile: dict, job: dict) -> dict:
         skill_pool.extend(_split_csv(v))
     skill_hint = ", ".join(_dedupe_keep_order(skill_pool)[:10]) or "Python, SQL, Git, AWS"
 
+    projects = _coerce_projects(data, skill_hint, title, profile=profile)
+
+    # Inject project tech_stack items into the skills section so ATS finds them.
+    # Projects can use ANY JD tool, and those must also appear in Technical Skills.
+    proj_tools: list[str] = []
+    for p in projects:
+        proj_tools.extend(_split_csv(p.get("tech_stack", "")))
+    existing_skills_lower = {s.lower().strip() for v in skills.values() for s in _split_csv(v)}
+    for tool in _dedupe_keep_order(proj_tools):
+        # Strip parenthetical fragments from items like "AWS (DynamoDB, ECS)" that got split by CSV parsing
+        clean = re.sub(r'\s*\(.*$', '', tool).strip().rstrip(')')
+        if not clean or len(clean) < 2:
+            continue
+        if clean.lower().strip() not in existing_skills_lower:
+            skills["Developer Tools"] = (skills.get("Developer Tools", "") + ", " + clean).strip(", ")
+            existing_skills_lower.add(clean.lower().strip())
+
     return {
         "title": title,
         "education": _coerce_education(data, profile),
         "experience": _coerce_experience(data, profile, skill_hint),
-        "projects": _coerce_projects(data, skill_hint, title),
+        "projects": projects,
         "skills": skills,
     }
 
@@ -596,6 +906,40 @@ def _ats_check_is_blocking() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _tailor_max_tokens() -> int:
+    """Max output tokens for tailor JSON generation."""
+    raw = os.environ.get("APPLYPILOT_TAILOR_MAX_TOKENS", "4096").strip()
+    try:
+        return max(1024, min(8192, int(raw)))
+    except ValueError:
+        return 4096
+
+
+def _tailor_max_retries() -> int:
+    """Per-job retry count for tailoring.  Minimum 1 retry (2 total iterations)
+    to ensure every resume goes through at least one self-correction pass."""
+    raw = os.environ.get("APPLYPILOT_TAILOR_MAX_RETRIES", "1").strip()
+    try:
+        return max(1, min(5, int(raw)))
+    except ValueError:
+        return 1
+
+
+def _tailor_run_judge() -> bool:
+    """Whether to run the extra LLM-judge pass after validation."""
+    raw = os.environ.get("APPLYPILOT_TAILOR_RUN_JUDGE", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _tailor_commit_every() -> int:
+    """How many completed jobs to buffer before DB commit."""
+    raw = os.environ.get("APPLYPILOT_TAILOR_COMMIT_EVERY", "1").strip()
+    try:
+        return max(1, min(20, int(raw)))
+    except ValueError:
+        return 1
+
+
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
 def latex_escape(text: str) -> str:
@@ -603,6 +947,46 @@ def latex_escape(text: str) -> str:
 
     Only use on user/LLM-generated text, NOT on LaTeX structure.
     """
+    text = sanitize_text(str(text or ""))
+    # Normalize problematic Unicode into pdflatex-safe ASCII equivalents.
+    replacements = {
+        "\u00a0": " ",
+        "\u200b": "",
+        "\u200c": "",
+        "\u200d": "",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2022": "-",
+        "\u2026": "...",
+        "\u2190": "<-",
+        "\u2192": "->",
+        "\u2194": "<->",
+        "\u21d4": "<=>",
+        "\u21c4": "<->",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+
+    normalized_chars: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch in {"\n", "\t"} or 32 <= code < 127:
+            normalized_chars.append(ch)
+            continue
+        decomp = unicodedata.normalize("NFKD", ch).encode("ascii", "ignore").decode("ascii")
+        normalized_chars.append(decomp if decomp else " ")
+
+    text = "".join(normalized_chars)
+    text = re.sub(r"\s+", " ", text).strip()
+
     text = text.replace('\\', '\\textbackslash{}')
     for char, repl in [
         ('&', '\\&'), ('%', '\\%'), ('$', '\\$'), ('#', '\\#'),
@@ -1000,7 +1384,14 @@ def tailor_resume(
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
 
-    report: dict = {"attempts": 0, "validator": None, "ats_check": None, "judge": None, "status": "pending"}
+    report: dict = {
+        "attempts": 0,
+        "validator": None,
+        "ats_check": None,
+        "ats_rendered_check": None,
+        "judge": None,
+        "status": "pending",
+    }
     avoid_notes: list[str] = []
     tailored_latex = ""
     tailored_text = ""
@@ -1023,7 +1414,7 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=8192, temperature=0.0)
+        raw = client.chat(messages, max_tokens=_tailor_max_tokens(), temperature=0.0)
 
         # Parse JSON from response
         try:
@@ -1069,9 +1460,9 @@ def tailor_resume(
                 ats_check["bullet_compliance"] * 100,
                 "; ".join(ats_check["errors"])[:200],
             )
-            if ats_blocking and attempt < max_retries:
-                continue
             if ats_blocking:
+                if attempt < max_retries:
+                    continue
                 # Last attempt -- accept what we have but log the gap
                 log.warning(
                     "ATS check failed after all retries for %s: kw=%.0f%% bullets=%.0f%%",
@@ -1079,6 +1470,11 @@ def tailor_resume(
                     ats_check["keyword_coverage"] * 100,
                     ats_check["bullet_compliance"] * 100,
                 )
+                # Keep artifacts for inspection, but do not approve this resume.
+                tailored_latex = assemble_resume_latex(data, profile)
+                tailored_text = assemble_resume_text(data, profile)
+                report["status"] = "failed_validation"
+                return tailored_latex, tailored_text, report
             else:
                 log.info(
                     "ATS check advisory-only for %s: kw=%.0f%% bullets=%.0f%%",
@@ -1091,17 +1487,91 @@ def tailor_resume(
         tailored_latex = assemble_resume_latex(data, profile)
         tailored_text = assemble_resume_text(data, profile)
 
-        # Layer 3: LLM judge (advisory -- logged but does NOT block approval)
-        try:
-            judge = judge_tailored_resume(resume_text, tailored_text, job.get("title", ""), profile)
-            report["judge"] = judge
-            if not judge["passed"]:
-                log.debug("Judge advisory FAIL for %s: %s", job.get("title", "")[:40], judge["issues"][:200])
-        except Exception as e:
-            report["judge"] = {"passed": False, "verdict": "ERROR", "issues": str(e), "raw": ""}
-            log.debug("Judge call failed for %s: %s", job.get("title", "")[:40], e)
+        # Layer 2a-post: Quality gate on assembled LaTeX (catches placeholders, generic content)
+        tex_quality = validate_tex_quality(tailored_latex)
+        report["tex_quality"] = tex_quality
+        if not tex_quality["passed"]:
+            log.warning(
+                "Tex quality gate FAIL for %s (attempt %d): %s",
+                job.get("title", "")[:40], attempt + 1,
+                "; ".join(tex_quality["issues"])[:300],
+            )
+            avoid_notes.extend(tex_quality["issues"])
+            if attempt < max_retries:
+                continue
 
-        # Validation + ATS check passed → approve
+        # Layer 2b: Post-assembly ATS check on rendered text.
+        # This re-validates STEP 3 style constraints after JSON -> text/LaTeX
+        # conversion so we can iterate again when formatting drift appears.
+        ats_rendered_check = validate_ats_rendered_text(tailored_text, jd_full)
+        report["ats_rendered_check"] = ats_rendered_check
+        if not ats_rendered_check["passed"]:
+            avoid_notes.extend(ats_rendered_check["errors"])
+            log.debug(
+                "Rendered ATS FAIL for %s (attempt %d): kw=%.0f%% bullets=%.0f%% | %s",
+                job.get("title", "")[:40], attempt + 1,
+                ats_rendered_check["keyword_coverage"] * 100,
+                ats_rendered_check["bullet_compliance"] * 100,
+                "; ".join(ats_rendered_check["errors"])[:200],
+            )
+            if ats_blocking:
+                if attempt < max_retries:
+                    continue
+                log.warning(
+                    "Rendered ATS check failed after all retries for %s: kw=%.0f%% bullets=%.0f%%",
+                    job.get("title", "")[:40],
+                    ats_rendered_check["keyword_coverage"] * 100,
+                    ats_rendered_check["bullet_compliance"] * 100,
+                )
+                report["status"] = "failed_validation"
+                return tailored_latex, tailored_text, report
+
+        # Layer 3: Optional LLM judge (advisory only).
+        if _tailor_run_judge():
+            try:
+                judge = judge_tailored_resume(resume_text, tailored_text, job.get("title", ""), profile)
+                report["judge"] = judge
+                if not judge["passed"]:
+                    log.debug("Judge advisory FAIL for %s: %s", job.get("title", "")[:40], judge["issues"][:200])
+            except Exception as e:
+                report["judge"] = {"passed": False, "verdict": "ERROR", "issues": str(e), "raw": ""}
+                log.debug("Judge call failed for %s: %s", job.get("title", "")[:40], e)
+        else:
+            report["judge"] = {"passed": True, "verdict": "SKIPPED", "issues": "judge disabled", "raw": ""}
+
+        # Validation + ATS check passed → approve (but enforce 2nd iteration when bullets are weak)
+        if attempt == 0 and max_retries >= 1:
+            kw_pct = ats_check.get("keyword_coverage", 0) * 100
+            bl_pct = ats_check.get("bullet_compliance", 0) * 100
+
+            # Only force 2nd iteration if bullet compliance is below 75%.
+            # When 1st pass is already decent, the 2nd iteration tends to
+            # degrade bullet structure while chasing keyword density.
+            if bl_pct < 75:
+                bad_bullet_list = ats_check.get("bad_bullets", [])
+                bad_bullet_detail = ""
+                if bad_bullet_list:
+                    bad_bullet_detail = " Specific bad bullets: " + "; ".join(b[:100] for b in bad_bullet_list[:5])
+                avoid_notes.append(
+                    f"First pass: kw={kw_pct:.0f}% bullets={bl_pct:.0f}%. "
+                    "PRIORITY 1 — BULLET FORMULA: Re-read EVERY bullet in experience AND projects. "
+                    "Each MUST end with 'resulting in [measurable impact]'. "
+                    "Do NOT remove any keywords or skills to make room. "
+                    "Do NOT rewrite bullets that already follow the formula. "
+                    "ONLY fix bullets that are missing 'resulting in'."
+                    f"{bad_bullet_detail}"
+                )
+                log.info(
+                    "Mandatory 2nd iteration for %s (1st pass kw=%.0f%% bullets=%.0f%%)",
+                    job.get("title", "")[:40], kw_pct, bl_pct,
+                )
+                continue
+            else:
+                log.info(
+                    "Skipping 2nd iteration for %s (1st pass kw=%.0f%% bullets=%.0f%% — above threshold)",
+                    job.get("title", "")[:40], kw_pct, bl_pct,
+                )
+
         report["status"] = "approved"
         return tailored_latex, tailored_text, report
 
@@ -1111,24 +1581,74 @@ def tailor_resume(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
+def _make_file_prefix(job: dict) -> str:
+    """Build a safe, unique filename prefix for a job's output files."""
+    safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
+    safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+    id_source = str(job.get("url") or job.get("application_url") or f"{job.get('site','')}-{job.get('title','')}")
+    suffix = hashlib.sha1(id_source.encode("utf-8")).hexdigest()[:10]
+    return f"{safe_site}_{safe_title}_{suffix}"
+
+
+def _try_rezzy_tailor(job: dict, prefix: str) -> dict | None:
+    """Attempt to tailor via Rezzy API. Returns result dict or None to fallback."""
+    from applypilot.scoring.rezzy import is_rezzy_enabled, rezzy_tailor_resume, RezzyError
+
+    if not is_rezzy_enabled():
+        return None
+
+    try:
+        result = rezzy_tailor_resume(job, TAILORED_DIR, prefix)
+    except RezzyError as e:
+        log.warning("Rezzy error for %s — falling back to Copilot: %s", job["title"][:40], e)
+        return None
+
+    if result is None:
+        # Credits exhausted — disable Rezzy for the rest of this process
+        os.environ["APPLYPILOT_USE_REZZY"] = "0"
+        log.warning("Rezzy credits exhausted — disabling Rezzy for remaining jobs")
+        return None
+
+    log.info("[REZZY] %s — PDF ready: %s", job["title"][:40], result["pdf_path"])
+    return {
+        "url": job["url"],
+        "path": result["tex_path"],
+        "pdf_path": result["pdf_path"],
+        "title": job["title"],
+        "site": job["site"],
+        "status": "approved",
+        "attempts": 1,
+        "source": "rezzy",
+    }
+
+
 def _process_one_tailor(
     job: dict,
     resume_text: str,
     profile: dict,
     validation_mode: str = "normal",
 ) -> dict:
-    """Process a single job for tailoring (thread-safe)."""
+    """Process a single job for tailoring (thread-safe).
+
+    Tries Rezzy API first (produces its own PDF). Falls back to
+    Copilot LLM pipeline if Rezzy is unavailable or credits exhausted.
+    """
     try:
+        prefix = _make_file_prefix(job)
+
+        # --- Rezzy (primary) ---
+        rezzy_result = _try_rezzy_tailor(job, prefix)
+        if rezzy_result is not None:
+            return rezzy_result
+
+        # --- Copilot LLM (fallback) ---
         tailored_latex, tailored_text, report = tailor_resume(
             resume_text,
             job,
             profile,
+            max_retries=_tailor_max_retries(),
             validation_mode=validation_mode,
         )
-
-        safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-        safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-        prefix = f"{safe_site}_{safe_title}"
 
         tex_path = TAILORED_DIR / f"{prefix}.tex"
         tex_path.write_text(tailored_latex, encoding="utf-8")
@@ -1166,6 +1686,7 @@ def _process_one_tailor(
             "site": job["site"],
             "status": report["status"],
             "attempts": report["attempts"],
+            "source": "copilot",
         }
     except Exception as e:
         log.error("[ERROR] %s -- %s", job["title"][:40], e)
@@ -1207,7 +1728,7 @@ def run_tailoring(
     t0 = time.time()
     completed = 0
     _pending_commit: list[dict] = []
-    COMMIT_EVERY = 5
+    COMMIT_EVERY = _tailor_commit_every()
     results: list[dict] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
     _lock = threading.Lock()
@@ -1221,7 +1742,13 @@ def run_tailoring(
                     "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
                     (r["path"], now, r["url"]),
                 )
+            elif r["status"] == "error":
+                # Transient LLM errors: do NOT increment attempt counter
+                # so the job stays eligible for retry on next run.
+                pass
             else:
+                # Permanent failures (failed_validation, failed_judge):
+                # increment attempt counter toward exhaustion.
                 conn.execute(
                     "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
                     (r["url"],),

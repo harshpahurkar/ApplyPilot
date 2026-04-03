@@ -138,6 +138,15 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
 
+    # Create indexes for common query patterns (idempotent)
+    _ensure_indexes(conn)
+
+    # Named migrations for schema changes beyond column additions
+    run_migrations(conn)
+
+    # Session tracking table (pipeline run metadata)
+    _ensure_sessions_table(conn)
+
     return conn
 
 
@@ -219,6 +228,95 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
         conn.commit()
 
     return added
+
+
+# Indexes for common query patterns — dramatically improves performance
+# at scale (1000+ jobs). All are CREATE IF NOT EXISTS so safe to re-run.
+_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_jobs_apply_status ON jobs(apply_status)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_fit_score ON jobs(fit_score)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_site ON jobs(site)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_discovered_at ON jobs(discovered_at)",
+    # Compound index for the most common query: ready-to-apply
+    "CREATE INDEX IF NOT EXISTS idx_jobs_apply_ready ON jobs(apply_status, fit_score, site)",
+    # Enrichment queue
+    "CREATE INDEX IF NOT EXISTS idx_jobs_pending_detail ON jobs(detail_scraped_at)",
+    # Scoring queue
+    "CREATE INDEX IF NOT EXISTS idx_jobs_pending_score ON jobs(full_description, fit_score)",
+]
+
+
+def _ensure_indexes(conn: sqlite3.Connection) -> None:
+    """Create performance indexes on the jobs table (idempotent)."""
+    for ddl in _INDEXES:
+        conn.execute(ddl)
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Named migration system — for schema changes beyond column additions.
+#
+# Each migration is a (name, callable) pair.  `ensure_columns()` above still
+# handles new columns as a safety net, but index changes, type tweaks, data
+# backfills, or new tables should be registered here.
+#
+# Migrations run in declaration order and are idempotent: a `_migrations`
+# table tracks which have been applied so they never re-run.
+# ---------------------------------------------------------------------------
+
+def _ensure_migrations_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _migrations (
+            name       TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+# Registry — append new migrations at the end.  Each entry is
+# ("unique_name", callable(conn)).  The callable MUST be idempotent because
+# in edge cases it might run twice (e.g. crash between execute and commit).
+_NAMED_MIGRATIONS: list[tuple[str, callable]] = [
+    # Example:
+    # ("001_add_foo_column", lambda conn: conn.execute(
+    #     "ALTER TABLE jobs ADD COLUMN foo TEXT"
+    # )),
+]
+
+
+def run_migrations(conn: sqlite3.Connection | None = None) -> list[str]:
+    """Run all unapplied named migrations in order.
+
+    Returns list of migration names that were applied this run.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    _ensure_migrations_table(conn)
+
+    applied = {
+        row[0]
+        for row in conn.execute("SELECT name FROM _migrations").fetchall()
+    }
+
+    newly_applied: list[str] = []
+    for name, fn in _NAMED_MIGRATIONS:
+        if name in applied:
+            continue
+        try:
+            fn(conn)
+            conn.execute(
+                "INSERT INTO _migrations (name, applied_at) VALUES (?, ?)",
+                (name, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            newly_applied.append(name)
+        except Exception:
+            conn.rollback()
+            raise
+
+    return newly_applied
 
 
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:
@@ -447,3 +545,100 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+# ---------------------------------------------------------------------------
+# Session tracking — records pipeline run metadata for crash recovery and
+# diagnostics. Inspired by Claude Code's session state persistence.
+# ---------------------------------------------------------------------------
+
+def _ensure_sessions_table(conn: sqlite3.Connection) -> None:
+    """Create the sessions table (idempotent)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id    TEXT PRIMARY KEY,
+            started_at    TEXT NOT NULL,
+            finished_at   TEXT,
+            mode          TEXT,
+            stages        TEXT,
+            status        TEXT DEFAULT 'running',
+            jobs_processed INTEGER DEFAULT 0,
+            jobs_applied   INTEGER DEFAULT 0,
+            total_cost_usd REAL DEFAULT 0.0,
+            error_summary  TEXT,
+            extra_json     TEXT
+        )
+    """)
+    conn.commit()
+
+
+def create_session(
+    session_id: str,
+    mode: str = "pipeline",
+    stages: str = "",
+) -> None:
+    """Record a new pipeline session start."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions "
+        "(session_id, started_at, mode, stages, status) "
+        "VALUES (?, ?, ?, ?, 'running')",
+        (session_id, now, mode, stages),
+    )
+    conn.commit()
+
+
+def update_session(
+    session_id: str,
+    *,
+    status: str | None = None,
+    jobs_processed: int | None = None,
+    jobs_applied: int | None = None,
+    total_cost_usd: float | None = None,
+    error_summary: str | None = None,
+    extra_json: str | None = None,
+) -> None:
+    """Update an existing session with latest progress."""
+    conn = get_connection()
+    sets: list[str] = []
+    params: list = []
+
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+        if status in ("completed", "failed", "interrupted"):
+            sets.append("finished_at = ?")
+            params.append(datetime.now(timezone.utc).isoformat())
+    if jobs_processed is not None:
+        sets.append("jobs_processed = ?")
+        params.append(jobs_processed)
+    if jobs_applied is not None:
+        sets.append("jobs_applied = ?")
+        params.append(jobs_applied)
+    if total_cost_usd is not None:
+        sets.append("total_cost_usd = ?")
+        params.append(total_cost_usd)
+    if error_summary is not None:
+        sets.append("error_summary = ?")
+        params.append(error_summary)
+    if extra_json is not None:
+        sets.append("extra_json = ?")
+        params.append(extra_json)
+
+    if not sets:
+        return
+    params.append(session_id)
+    conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id = ?", params)
+    conn.commit()
+
+
+def get_last_session() -> dict | None:
+    """Return the most recent session record, or None."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    if row:
+        return dict(zip(row.keys(), row))
+    return None

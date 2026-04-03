@@ -5,9 +5,11 @@ Fallback path: parse structured text, render via HTML/CSS, export via Playwright
 """
 
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from pathlib import Path
 
 from applypilot.config import TAILORED_DIR
@@ -16,6 +18,125 @@ log = logging.getLogger(__name__)
 
 
 # ── LaTeX Compilation (primary path) ─────────────────────────────────────
+
+def _normalize_unicode_for_latex(text: str) -> str:
+    """Normalize unsupported Unicode to pdflatex-safe text."""
+    replacements = {
+        "\u00a0": " ",
+        "\u200b": "",
+        "\u200c": "",
+        "\u200d": "",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2022": "-",
+        "\u2026": "...",
+        "\u2190": "<-",
+        "\u2192": "->",
+        "\u2194": "<->",
+        "\u21d4": "<=>",
+        "\u21c4": "<->",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+
+    normalized_chars: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch in {"\n", "\t"} or 32 <= code < 127:
+            normalized_chars.append(ch)
+            continue
+        decomp = unicodedata.normalize("NFKD", ch).encode("ascii", "ignore").decode("ascii")
+        normalized_chars.append(decomp if decomp else " ")
+
+    normalized = "".join(normalized_chars)
+    normalized = re.sub(r"[\t ]+", " ", normalized)
+    return normalized
+
+
+def _sanitize_latex(text: str) -> str:
+    """Fix common LLM-generated LaTeX issues before compilation."""
+    # Remove empty itemize environments (missing \item)
+    text = re.sub(
+        r"\\resumeItemListStart\s*\\resumeItemListEnd",
+        "",
+        text,
+    )
+    # Remove empty subheading lists
+    text = re.sub(
+        r"\\resumeSubHeadingListStart\s*\\resumeSubHeadingListEnd",
+        "",
+        text,
+    )
+    # Remove empty sections (section header followed immediately by another section or end)
+    text = re.sub(
+        r"\\section\{[^}]*\}\s*(?=\\section\{|\\end\{document\})",
+        "",
+        text,
+    )
+    return text
+
+
+# ── Quality Gate: verify tex content before compilation ──────────────────
+
+_PLACEHOLDER_PATTERNS = [
+    re.compile(r"Targeted\s+.+?\s+Project\s+\d", re.IGNORECASE),
+    re.compile(r"Platform\s+Project\s+\d", re.IGNORECASE),
+    re.compile(r"Project\s+[12]}\s*\$\|\\$", re.IGNORECASE),
+]
+
+_GENERIC_BULLET_SIGS = [
+    "reduced deployment errors by 50%",
+    "improved api latency by 38%",
+    "reduced regression cycle time by 35% by automating core tests",
+]
+
+
+def validate_tex_quality(tex_content: str) -> dict:
+    """Pre-compilation quality gate that catches placeholder/generic content.
+
+    Returns:
+        {"passed": bool, "issues": list[str]}
+    """
+    issues: list[str] = []
+    lower = tex_content.lower()
+
+    # Check for placeholder project names
+    for pat in _PLACEHOLDER_PATTERNS:
+        match = pat.search(tex_content)
+        if match:
+            issues.append(f"Placeholder project name: '{match.group().strip()}'")
+
+    # Check for generic fallback bullets (identical defaults)
+    generic_count = sum(1 for sig in _GENERIC_BULLET_SIGS if sig in lower)
+    if generic_count >= 2:
+        issues.append(f"Found {generic_count} generic fallback bullets — resume may be untailored")
+
+    # Check for tech stack dumping (>8 items in a single project tech line)
+    for m in re.finditer(r"\\emph\{\\small\s+([^}]+)\}", tex_content):
+        tech_list = [t.strip() for t in m.group(1).split(",") if t.strip()]
+        if len(tech_list) > 8:
+            issues.append(f"Tech stack dump ({len(tech_list)} items) in project: {', '.join(tech_list[:5])}...")
+
+    # Check for duplicate bullets across projects/experience
+    bullet_texts = re.findall(r"\\resumeItem\{([^}]{30,})\}", tex_content)
+    seen: dict[str, int] = {}
+    for bt in bullet_texts:
+        key = bt.lower().strip()[:80]
+        seen[key] = seen.get(key, 0) + 1
+    dupes = [k for k, v in seen.items() if v > 1]
+    if dupes:
+        issues.append(f"Duplicate bullet(s) across sections: {len(dupes)} repeated")
+
+    return {"passed": len(issues) == 0, "issues": issues}
+
 
 def compile_latex_to_pdf(
     tex_path: Path, output_path: Path | None = None, clean: bool = True
@@ -73,7 +194,9 @@ def compile_latex_to_pdf(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         tmp_tex = tmp / tex_path.name
-        tmp_tex.write_text(tex_path.read_text(encoding="utf-8"), encoding="utf-8")
+        source_tex = tex_path.read_text(encoding="utf-8", errors="replace")
+        sanitized = _sanitize_latex(_normalize_unicode_for_latex(source_tex))
+        tmp_tex.write_text(sanitized, encoding="utf-8")
 
         cmd = [
             pdflatex,
@@ -475,15 +598,11 @@ def compile_cover_letter_pdf(
 
     # Escape LaTeX special characters
     def _esc(s: str) -> str:
+        s = _normalize_unicode_for_latex(s)
         for ch in ("\\", "&", "%", "$", "#", "_", "{", "}"):
             s = s.replace(ch, f"\\{ch}")
         s = s.replace("~", r"\textasciitilde{}")
         s = s.replace("^", r"\textasciicircum{}")
-        # Smart quotes → straight
-        s = s.replace("\u2018", "'").replace("\u2019", "'")
-        s = s.replace("\u201c", "``").replace("\u201d", "''")
-        # Em/en dashes → hyphens (should be caught by validator, but just in case)
-        s = s.replace("\u2014", "---").replace("\u2013", "--")
         return s
 
     escaped = _esc(text)
@@ -537,7 +656,19 @@ def convert_to_pdf(
 
     # LaTeX path (primary)
     if source_path.suffix == ".tex":
-        return compile_latex_to_pdf(source_path, output_path)
+        try:
+            return compile_latex_to_pdf(source_path, output_path)
+        except Exception as exc:
+            txt_fallback = source_path.with_suffix(".txt")
+            if txt_fallback.exists():
+                log.warning(
+                    "LaTeX compile failed for %s, falling back to text render: %s",
+                    source_path.name,
+                    exc,
+                )
+                fallback_out = output_path or source_path.with_suffix(".pdf")
+                return convert_to_pdf(txt_fallback, fallback_out, html_only=html_only)
+            raise
 
     # Legacy text path (fallback)
     text = source_path.read_text(encoding="utf-8")

@@ -209,15 +209,8 @@ def launch_chrome(worker_id: int, port: int | None = None,
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
 
-    # Clear cookies from previous job to prevent cross-site contamination
-    # (e.g., SAP SuccessFactors session leaking into Workday)
-    for cookie_file in ("Cookies", "Cookies-journal"):
-        cf = profile_dir / "Default" / cookie_file
-        if cf.exists():
-            try:
-                cf.unlink()
-            except (PermissionError, OSError):
-                pass
+    # NOTE: Cookies are preserved across jobs to keep login sessions
+    # (Indeed, LinkedIn, etc.) alive between applications.
 
     chrome_exe = config.get_chrome_path()
 

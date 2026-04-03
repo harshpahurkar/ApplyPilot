@@ -8,6 +8,7 @@ profile at runtime. No hardcoded personal information.
 import json
 import logging
 import re
+import hashlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,17 +46,21 @@ def _build_cover_letter_prompt(profile: dict) -> str:
     all_skills: list[str] = []
     for items in boundary.values():
         if isinstance(items, list):
-            all_skills.extend(items)
+            all_skills.extend(str(s) for s in items)
     skills_str = ", ".join(all_skills) if all_skills else "the tools listed in the resume"
 
     # Real metrics from resume_facts
-    real_metrics = resume_facts.get("real_metrics", [])
+    real_metrics = [str(m) for m in resume_facts.get("real_metrics", []) if not isinstance(m, dict)]
     preserved_projects = resume_facts.get("preserved_projects", [])
 
     # Build achievement examples for the prompt
     projects_hint = ""
     if preserved_projects:
-        projects_hint = f"\nKnown projects to reference: {', '.join(preserved_projects)}"
+        proj_names = [
+            p["name"] if isinstance(p, dict) else str(p)
+            for p in preserved_projects
+        ]
+        projects_hint = f"\nKnown projects to reference: {', '.join(proj_names)}"
 
     metrics_hint = ""
     if real_metrics:
@@ -238,7 +243,9 @@ def run_cover_letters(
 
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            id_source = str(job.get("url") or job.get("application_url") or f"{job.get('site','')}-{job.get('title','')}")
+            suffix = hashlib.sha1(id_source.encode("utf-8")).hexdigest()[:10]
+            prefix = f"{safe_site}_{safe_title}_{suffix}"
 
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")
@@ -279,6 +286,9 @@ def run_cover_letters(
                     (r["path"], now, r["url"]),
                 )
                 saved += 1
+            elif r.get("error"):
+                # Transient LLM errors: do NOT increment attempt counter
+                pass
             else:
                 conn.execute(
                     "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",

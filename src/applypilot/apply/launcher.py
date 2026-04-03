@@ -27,7 +27,12 @@ from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection
+from applypilot.errors import ErrorCategory, classify_apply_error
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply.stealth import (
+    get_pacer, get_budget, get_rotator,
+    prepare_copilot_env,
+)
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -44,101 +49,6 @@ logger = logging.getLogger(__name__)
 def _load_blocked():
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
-
-
-# ---------------------------------------------------------------------------
-# Role / seniority filtering
-# ---------------------------------------------------------------------------
-
-# Always skip these seniority levels (waste of time for a new-grad)
-_SKIP_TITLE_KEYWORDS = {
-    "senior", "sr.", "sr ", "staff", "principal", "distinguished",
-    "director", "vp ", "vice president", "head of", "chief",
-    "architect",  # almost always senior-level
-}
-
-# Internship / co-op / student keywords
-_INTERN_KEYWORDS = {"intern", "internship", "co-op", "coop", "student", "stagiaire"}
-
-
-# Patterns that indicate a job is in Canada
-_CANADA_PATTERNS = (
-    "canada", ", on,", ", on ", ", bc,", ", bc ", ", ab,", ", ab ",
-    ", qc,", ", qc ", ", mb,", ", mb ", ", sk,", ", sk ",
-    ", ns,", ", ns ", ", nb,", ", nb ", ", nl,", ", nl ",
-    ", pe,", ", pe ",
-    "ontario", "quebec", "british columbia", "alberta",
-    "manitoba", "saskatchewan", "nova scotia",
-    "toronto", "montreal", "vancouver", "ottawa", "calgary",
-    "edmonton", "winnipeg", "waterloo", "kitchener", "mississauga",
-    "brampton", "markham", "hamilton", "london, on", "halifax",
-    "victoria, bc", "saskatoon", "regina",
-)
-
-
-# Non-Canada geo restrictions commonly seen in remote location strings.
-# If a role is remote but explicitly restricted to these regions, skip it.
-_REMOTE_NON_CANADA_HINTS = (
-    "us only", "usa only", "u.s. only", "united states only", "america only",
-    "remote - us", "remote (us", "us remote", "remote us",
-    "remote - usa", "remote (usa", "remote usa",
-    "remote - united states", "remote (united states",
-    "remote - india", "remote (india", "india only",
-    "remote - uk", "remote (uk", "uk only", "united kingdom only",
-    "remote - europe", "remote (europe", "europe only", "eu only",
-    "emea only", "apac only", "anz only",
-    "remote - australia", "australia only",
-    "remote - new zealand", "new zealand only",
-    "remote - singapore", "singapore only",
-)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    """Parse common truthy environment flag values."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _should_skip_role(title: str, location: str | None) -> str | None:
-    """Return a skip reason if this job should be filtered out, else None.
-
-        Rules:
-            1. Senior / staff / principal / director / lead-architect -> always skip
-            2. Canada locations are allowed
-            3. Fully remote jobs are allowed only when location is not geo-restricted to non-Canada
-            4. Non-remote jobs outside Canada are skipped
-            5. Unknown/blank location is skipped (safety to avoid non-Canada jobs)
-    """
-    if _env_flag("APPLYPILOT_DISABLE_ROLE_FILTER", default=False):
-        return None
-
-    t = title.lower()
-    loc = (location or "").lower()
-
-    # Rule 1: Skip senior-level roles
-    for kw in _SKIP_TITLE_KEYWORDS:
-        if kw in t:
-            return f"seniority:{kw.strip()}"
-
-    # Safety first: if location is missing, do not apply.
-    if not loc.strip():
-        return "location:unknown"
-
-    # Rule 2: Canada-only filter for non-remote roles.
-    is_remote = any(x in loc for x in ("remote", "anywhere", "work from home"))
-    in_canada = any(x in loc for x in _CANADA_PATTERNS)
-    if not is_remote and not in_canada:
-        return "location:not_canada_not_remote"
-
-    # Rule 3: For remote roles, reject explicit non-Canada geo restrictions.
-    if is_remote and not in_canada:
-        if any(x in loc for x in _REMOTE_NON_CANADA_HINTS):
-            return "location:remote_non_canada"
-
-    return None  # keep
-
 
 # How often to poll the DB when the queue is empty (seconds)
 POLL_INTERVAL = config.DEFAULTS["poll_interval"]
@@ -161,12 +71,13 @@ if platform.system() != "Windows":
 # ---------------------------------------------------------------------------
 
 def _make_mcp_config(cdp_port: int) -> dict:
-    """Build Claude Code MCP config dict for a specific CDP port."""
+    """Build MCP config dict for a specific CDP port."""
     return {
         "mcpServers": {
             "playwright": {
                 "command": "npx",
                 "args": [
+                    "-y",
                     "@playwright/mcp@latest",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
@@ -178,7 +89,6 @@ def _make_mcp_config(cdp_port: int) -> dict:
             },
         }
     }
-
 
 
 # ---------------------------------------------------------------------------
@@ -199,153 +109,135 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     """
     from applypilot.config import is_manual_ats
 
-    # Loop to skip ineligible jobs (manual ATS, wrong seniority, etc.)
-    # Each iteration acquires the DB lock, checks one candidate, and either
-    # claims it or marks it skipped and tries again.
-    max_skips = 200  # safety valve
-    for _ in range(max_skips):
-        conn = get_connection()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        manual_updates = 0
 
-            if target_url:
-                like = f"%{target_url.split('?')[0].rstrip('/')}%"
-                row = conn.execute("""
-                    SELECT url, title, site, application_url, tailored_resume_path,
-                           fit_score, location, full_description, cover_letter_path
-                    FROM jobs
-                    WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                      AND tailored_resume_path IS NOT NULL
-                      AND (apply_status IS NULL OR apply_status != 'in_progress')
-                    LIMIT 1
-                """, (target_url, target_url, like, like)).fetchone()
-            else:
-                blocked_sites, blocked_patterns = _load_blocked()
-                site_filter = " AND ".join(f"site != '{s}'" for s in blocked_sites) if blocked_sites else "1=1"
-                # Filter on the URL we'll ACTUALLY navigate to (application_url if available)
-                apply_url_filter = " AND ".join(
-                    f"COALESCE(application_url, url) NOT LIKE '{p}'" for p in blocked_patterns
-                ) if blocked_patterns else "1=1"
-                row = conn.execute(f"""
-                    SELECT url, title, site, application_url, tailored_resume_path,
-                           fit_score, location, full_description, cover_letter_path
-                    FROM jobs
-                    WHERE tailored_resume_path IS NOT NULL
-                      AND (apply_status IS NULL OR apply_status IN ('ready', 'failed'))
-                      AND (apply_attempts IS NULL OR apply_attempts < {config.DEFAULTS["max_apply_attempts"]})
-                      AND fit_score >= ?
-                      AND (site != 'linkedin'
-                           OR (application_url IS NOT NULL
-                               AND application_url != ''
-                               AND application_url NOT LIKE '%linkedin.com%'))
-                      AND ({site_filter})
-                      AND ({apply_url_filter})
-                      AND NOT EXISTS (
-                          SELECT 1 FROM jobs j2
-                          WHERE j2.application_url = COALESCE(jobs.application_url, jobs.url)
-                            AND j2.url != jobs.url
-                            AND j2.application_url IS NOT NULL
-                            AND j2.application_url != ''
-                            AND (j2.apply_attempts >= {config.DEFAULTS["max_apply_attempts"]}
-                                 OR j2.apply_status IN ('applied', 'skipped'))
-                      )
-                    ORDER BY
-                      -- Tier 0: Known ATS with standard forms (best success rate) --
-                      CASE
-                        WHEN COALESCE(application_url, url) LIKE '%ashbyhq.com%'
-                             OR COALESCE(application_url, url) LIKE '%greenhouse.io%'
-                             OR COALESCE(application_url, url) LIKE '%grnh.se%'
-                             OR COALESCE(application_url, url) LIKE '%smartrecruiters.com%'
-                             OR COALESCE(application_url, url) LIKE '%workable.com%'
-                             OR COALESCE(application_url, url) LIKE '%teamtailor.com%'
-                             OR COALESCE(application_url, url) LIKE '%jobvite.com%'
-                             OR COALESCE(application_url, url) LIKE '%bamboohr.com%'
-                             OR COALESCE(application_url, url) LIKE '%rippling.com%'
-                             OR COALESCE(application_url, url) LIKE '%pinpointhq.com%'
-                             OR COALESCE(application_url, url) LIKE '%breezy.hr%'
-                             OR COALESCE(application_url, url) LIKE '%applytojob%'
-                             OR COALESCE(application_url, url) LIKE '%humi.ca%'
-                        THEN 0
-                        -- Tier 1: Other employer sites --
-                        WHEN site != 'indeed' THEN 1
-                        -- Tier 2: Workday/Indeed need special handling, often expired --
-                        WHEN COALESCE(application_url, url) LIKE '%workday%'
-                        THEN 2
-                        -- Tier 3: Indeed (mostly expired, captcha-heavy) --
-                        ELSE 3
-                      END,
-                      -- Freshness first: newest jobs get applied to first --
-                      COALESCE(date_posted, discovered_at) DESC,
-                      fit_score DESC
-                    LIMIT 1
-                """, (min_score,)).fetchone()
+        if target_url:
+            like = f"%{target_url.split('?')[0].rstrip('/')}%"
+            row = conn.execute("""
+                SELECT url, title, site, application_url, tailored_resume_path,
+                       fit_score, location, full_description, cover_letter_path
+                FROM jobs
+                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+                  AND tailored_resume_path IS NOT NULL
+                  AND apply_status != 'in_progress'
+                LIMIT 1
+            """, (target_url, target_url, like, like)).fetchone()
+        else:
+            blocked_sites, blocked_patterns = _load_blocked()
+            # Build parameterized filters to avoid SQL injection
+            params: list = [min_score]
+            site_clause = ""
+            if blocked_sites:
+                placeholders = ",".join("?" * len(blocked_sites))
+                site_clause = f"AND site NOT IN ({placeholders})"
+                params.extend(blocked_sites)
+            url_clauses = ""
+            if blocked_patterns:
+                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                params.extend(blocked_patterns)
+            rows = conn.execute(f"""
+                SELECT url, title, site, application_url, tailored_resume_path,
+                       fit_score, location, full_description, cover_letter_path,
+                       CASE
+                           WHEN COALESCE(application_url, url) LIKE '%greenhouse.io%' THEN 1
+                           WHEN COALESCE(application_url, url) LIKE '%boards.greenhouse.io%' THEN 1
+                           WHEN COALESCE(application_url, url) LIKE '%grnh.se%' THEN 1
+                           WHEN COALESCE(application_url, url) LIKE '%careerpuck.com%' THEN 1
+                           WHEN COALESCE(application_url, url) LIKE '%ashbyhq.com%' THEN 2
+                           WHEN COALESCE(application_url, url) LIKE '%jobs.ashby.com%' THEN 2
+                           WHEN COALESCE(application_url, url) LIKE '%lever.co%' THEN 3
+                           WHEN COALESCE(application_url, url) LIKE '%jobs.lever.co%' THEN 3
+                           WHEN COALESCE(application_url, url) LIKE '%smartrecruiters.com%' THEN 4
+                           WHEN COALESCE(application_url, url) LIKE '%betterteam.com%' THEN 4
+                           WHEN COALESCE(application_url, url) LIKE '%rippling.com%' THEN 4
+                           WHEN COALESCE(application_url, url) LIKE '%workable.com%' THEN 4
+                           WHEN COALESCE(application_url, url) LIKE '%elastic.co%' THEN 4
+                           WHEN COALESCE(application_url, url) LIKE '%applytojob.com%' THEN 4
+                           WHEN COALESCE(application_url, url) LIKE '%recruitingbypaycor.com%' THEN 4
+                           WHEN COALESCE(application_url, url) LIKE '%myworkdayjobs.com%' THEN 7
+                           WHEN COALESCE(application_url, url) LIKE '%wd5.myworkdaysite%' THEN 7
+                           WHEN COALESCE(application_url, url) LIKE '%workday.com%' THEN 7
+                           WHEN COALESCE(application_url, url) LIKE '%successfactors.com%' THEN 7
+                           WHEN COALESCE(application_url, url) LIKE '%careers.wbd.com%' THEN 7
+                           WHEN COALESCE(application_url, url) LIKE '%scotiabank.com%' THEN 7
+                           WHEN COALESCE(application_url, url) LIKE '%ca.indeed.com%' THEN 6
+                           ELSE 5
+                       END AS portal_priority
+                FROM jobs
+                WHERE tailored_resume_path IS NOT NULL
+                  AND (apply_status IS NULL OR apply_status = 'failed')
+                  AND (apply_attempts IS NULL OR apply_attempts < ?)
+                  AND fit_score >= ?
+                  {site_clause}
+                  {url_clauses}
+                ORDER BY portal_priority ASC, fit_score DESC, url
+                LIMIT 50
+            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchall()
 
-            if not row:
-                conn.rollback()
+            row = None
+            for candidate in rows:
+                apply_url = candidate["application_url"] or candidate["url"]
+                if is_manual_ats(apply_url):
+                    conn.execute(
+                        "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                        (candidate["url"],),
+                    )
+                    manual_updates += 1
+                    continue
+
+                resume_path = candidate["tailored_resume_path"] or ""
+                resume_pdf = Path(resume_path).with_suffix(".pdf") if resume_path else None
+                if not resume_pdf or not resume_pdf.exists():
+                    continue
+
+                row = candidate
+                break
+
+        if not row:
+            if target_url is None and manual_updates:
+                conn.commit()
                 return None
-
-            # --- Check 1: Manual ATS (unsolvable CAPTCHAs) ---
-            apply_url = row["application_url"] or row["url"]
-            if is_manual_ats(apply_url):
-                conn.execute(
-                    "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                    (row["url"],),
-                )
-                conn.commit()
-                logger.info("Skipping manual ATS: %s", row["url"][:80])
-                continue  # try next job
-
-            # --- Check 1b: LinkedIn apply URLs / broken apply URLs ---
-            # Skip ONLY if the application URL itself points to LinkedIn
-            # (requires login) or is broken.  Do NOT skip jobs that were
-            # *discovered* on LinkedIn but have an external ATS apply URL.
-            apply_is_linkedin = "linkedin.com" in (apply_url or "").lower()
-            apply_is_broken = "error=true" in (apply_url or "").lower()
-            apply_has_no_url = not apply_url or apply_url.strip() == ""
-            if (not target_url
-                    and (apply_is_linkedin or apply_is_broken or apply_has_no_url)):
-                conn.execute(
-                    "UPDATE jobs SET apply_status = 'skipped', apply_error = ? WHERE url = ?",
-                    ("linkedin_source", row["url"]),
-                )
-                conn.commit()
-                logger.info("Skipping LinkedIn/broken apply URL: %s", apply_url[:80])
-                continue  # try next job
-
-            # --- Check 2: Role seniority / internship filter ---
-            skip_reason = _should_skip_role(row["title"], row["location"])
-            if skip_reason and not target_url:
-                conn.execute(
-                    "UPDATE jobs SET apply_status = 'skipped', apply_error = ? WHERE url = ?",
-                    (skip_reason, row["url"]),
-                )
-                conn.commit()
-                logger.info("Skipping [%s]: %s", skip_reason, row["title"][:60])
-                continue  # try next job
-
-            # --- All checks passed: claim this job ---
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute("""
-                UPDATE jobs SET apply_status = 'in_progress',
-                               agent_id = ?,
-                               last_attempted_at = ?
-                WHERE url = ?
-            """, (f"worker-{worker_id}", now, row["url"]))
-            conn.commit()
-            return dict(row)
-
-        except Exception:
             conn.rollback()
-            raise
+            return None
 
-    logger.warning("Exhausted %d skip iterations", max_skips)
-    return None
+        # Skip manual ATS sites (unsolvable CAPTCHAs)
+        apply_url = row["application_url"] or row["url"]
+        if is_manual_ats(apply_url):
+            conn.execute(
+                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                (row["url"],),
+            )
+            conn.commit()
+            logger.info("Skipping manual ATS: %s", row["url"][:80])
+            return None
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("""
+            UPDATE jobs SET apply_status = 'in_progress',
+                           agent_id = ?,
+                           last_attempted_at = ?
+            WHERE url = ?
+        """, (f"worker-{worker_id}", now, row["url"]))
+        conn.commit()
+
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None) -> None:
-    """Update a job's apply status in the database."""
+    """Update a job's apply status in the database.
+
+    Uses structured error classification: permanent errors get attempts=99,
+    transient errors increment normally. If `permanent` is not explicitly
+    set, the error category is inferred from the status/error text.
+    """
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
@@ -356,12 +248,15 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
     else:
+        # Auto-classify if permanent flag not explicitly set
+        if not permanent:
+            category = classify_apply_error(status, error or "")
+            permanent = category.is_permanent
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?,
-                           applied_at = NULL
+                           apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
         """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
@@ -375,47 +270,6 @@ def release_lock(url: str) -> None:
         (url,),
     )
     conn.commit()
-
-
-def _cleanup_dead_job(job: dict) -> None:
-    """Delete an expired/404 job's resume files and DB record entirely.
-
-    This removes:
-    - Tailored resume PDF + .tex + .txt
-    - Cover letter PDF + .tex + .txt
-    - The job row from the database
-    """
-    url = job["url"]
-    title = job.get("title", "")[:40]
-    deleted_files = 0
-
-    # Delete resume files
-    for path_key in ("tailored_resume_path", "cover_letter_path"):
-        base_path = job.get(path_key)
-        if not base_path:
-            continue
-        base = Path(base_path)
-        for ext in ("", ".tex", ".txt"):
-            p = base.with_suffix(ext) if ext else base
-            try:
-                if p.exists():
-                    p.unlink()
-                    deleted_files += 1
-            except Exception:
-                pass
-        # Also try without suffix replacement (PDF already has .pdf)
-        try:
-            if base.exists():
-                base.unlink()
-                deleted_files += 1
-        except Exception:
-            pass
-
-    # Delete from database
-    conn = get_connection()
-    conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
-    conn.commit()
-    logger.info("Cleaned expired job: %s (%d files deleted)", title, deleted_files)
 
 
 # ---------------------------------------------------------------------------
@@ -478,8 +332,7 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     else:
         conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL,
-                           applied_at = NULL
+                           apply_attempts = 99, agent_id = NULL
             WHERE url = ?
         """, (reason or "manual", url))
     conn.commit()
@@ -494,8 +347,7 @@ def reset_failed() -> int:
     conn = get_connection()
     cursor = conn.execute("""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
-                                             apply_attempts = 0, agent_id = NULL,
-                                             applied_at = NULL
+                       apply_attempts = 0, agent_id = NULL
         WHERE apply_status = 'failed'
           OR (apply_status IS NOT NULL AND apply_status != 'applied'
               AND apply_status != 'in_progress')
@@ -508,17 +360,6 @@ def reset_failed() -> int:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
-def _proxy_available() -> bool:
-    """Check whether the local API proxy is reachable."""
-    _url = os.environ.get("APPLYPILOT_PROXY_URL", "http://localhost:4000")
-    try:
-        import urllib.request
-        urllib.request.urlopen(f"{_url}/health", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
 def _backend_available(name: str) -> bool:
     """Return whether an apply backend is installed on this machine."""
     if name == "copilot":
@@ -528,16 +369,64 @@ def _backend_available(name: str) -> bool:
 
 def _select_backend(preferred: str) -> str | None:
     """Resolve preferred backend into a concrete backend name."""
-    pref = (preferred or "claude").strip().lower()
+    pref = (preferred or "copilot").strip().lower()
     if pref == "auto":
-        if _backend_available("claude"):
-            return "claude"
         if _backend_available("copilot"):
             return "copilot"
+        if _backend_available("claude"):
+            return "claude"
         return None
     if pref in {"claude", "copilot"} and _backend_available(pref):
         return pref
     return None
+
+
+def _copilot_apply_default_model() -> str:
+    """Return the default model string to use for Copilot apply sessions."""
+    override = os.environ.get("APPLYPILOT_COPILOT_APPLY_MODEL", "").strip()
+    if override:
+        return override
+
+    shared = os.environ.get("COPILOT_LLM_MODEL", "").strip()
+    if shared:
+        return shared
+
+    return "gpt-4.1"
+
+
+def _normalize_model_for_backend(model: str, backend: str) -> str:
+    """Map user-facing model aliases to backend-valid model identifiers."""
+    requested = (model or "").strip()
+    if backend == "claude":
+        if not requested or requested.lower() == "haiku":
+            return os.environ.get(
+                "APPLYPILOT_CLAUDE_APPLY_MODEL", "claude-sonnet-4.6"
+            )
+        return requested
+    if backend != "copilot":
+        return requested or "haiku"
+
+    default_model = _copilot_apply_default_model()
+    if not requested:
+        return default_model
+
+    lowered = requested.lower()
+    haiku_aliases = {
+        "haiku",
+        "claude-haiku",
+        "claude_haiku",
+        "claude-3-haiku",
+        "claude-3.5-haiku",
+        "claude-3-5-haiku",
+        "claude-3-5-haiku-latest",
+    }
+    if lowered in haiku_aliases:
+        return (
+            os.environ.get("APPLYPILOT_COPILOT_MODEL_HAIKU_EQUIVALENT", "").strip()
+            or default_model
+        )
+
+    return requested
 
 
 def _build_agent_command(
@@ -585,17 +474,13 @@ def _build_agent_command(
             )
             return shlex.split(rendered, posix=(platform.system() != "Windows"))
 
-        # Prefer invoking the npm package loader directly via node on Windows.
+        # Prefer invoking the npm loader directly via node on Windows.
         # This avoids wrapper (.bat/.ps1) command-line length limits.
         appdata = os.environ.get("APPDATA", "")
         node_exe = shutil.which("node")
         npm_loader = Path(appdata) / "npm" / "node_modules" / "@github" / "copilot" / "npm-loader.js"
         if platform.system() == "Windows" and node_exe and npm_loader.exists():
-            return [
-                node_exe,
-                str(npm_loader),
-                *copilot_args,
-            ]
+            return [node_exe, str(npm_loader), *copilot_args]
 
         copilot_exe = shutil.which("copilot")
         if copilot_exe:
@@ -612,11 +497,9 @@ def _build_agent_command(
 
     return None
 
-
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str = "haiku", dry_run: bool = False,
-        use_proxy: bool = False,
-        agent_backend: str = "claude") -> tuple[str, int]:
+            agent_backend: str = "copilot") -> tuple[str, int]:
     """Spawn an agent session for one job application.
 
     Returns:
@@ -650,11 +533,26 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         update_state(worker_id, status="failed", last_action=reason[:35])
         return f"failed:{reason}", duration_ms
 
-    # Copilot CLI v1 expects prompt text via -p (arg), so very large prompts
-    # can hit Windows command length limits. Keep both the opening context and
-    # the RESULT protocol at the tail by truncating head+tail.
+    effective_model = _normalize_model_for_backend(model, selected_backend)
+    if effective_model != model:
+        add_event(
+            f"[W{worker_id}] Model mapped for {selected_backend}: {model} -> {effective_model}"
+        )
+        logger.info(
+            "Worker %d mapped model '%s' to '%s' for backend '%s'",
+            worker_id,
+            model,
+            effective_model,
+            selected_backend,
+        )
+
+    # Copilot CLI expects prompt text via -p (arg), so very large prompts can
+    # hit Windows command length limits. Keep the beginning and RESULT tail.
     if selected_backend == "copilot":
-        max_chars = int(os.environ.get("APPLYPILOT_COPILOT_PROMPT_MAX", "12000"))
+        try:
+            max_chars = int(os.environ.get("APPLYPILOT_COPILOT_PROMPT_MAX", "12000"))
+        except ValueError:
+            max_chars = 12000
         if len(agent_prompt) > max_chars:
             head = int(max_chars * 0.7)
             tail = max_chars - head
@@ -671,30 +569,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 max_chars,
             )
 
-    # Gmail tools that must never be used (safety: read-only Gmail access)
-    _disallowed = ",".join([
-        "mcp__gmail__draft_email",
-        "mcp__gmail__modify_email",
-        "mcp__gmail__delete_email",
-        "mcp__gmail__download_attachment",
-        "mcp__gmail__batch_modify_emails",
-        "mcp__gmail__batch_delete_emails",
-        "mcp__gmail__create_label",
-        "mcp__gmail__update_label",
-        "mcp__gmail__delete_label",
-        "mcp__gmail__get_or_create_label",
-        "mcp__gmail__list_email_labels",
-        "mcp__gmail__create_filter",
-        "mcp__gmail__list_filters",
-        "mcp__gmail__get_filter",
-        "mcp__gmail__delete_filter",
-    ])
+    disallowed_tools = (
+        "mcp__gmail__draft_email,mcp__gmail__modify_email,"
+        "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
+        "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
+        "mcp__gmail__create_label,mcp__gmail__update_label,"
+        "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
+        "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
+        "mcp__gmail__list_filters,mcp__gmail__get_filter,"
+        "mcp__gmail__delete_filter"
+    )
 
     cmd = _build_agent_command(
         backend=selected_backend,
-        model=model,
+        model=effective_model,
         mcp_config_path=mcp_config_path,
-        disallowed_tools=_disallowed,
+        disallowed_tools=disallowed_tools,
         prompt_text=agent_prompt,
     )
     if not cmd:
@@ -708,42 +598,42 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     if selected_backend == "copilot":
-        env.setdefault("CI", "1")
-        env.setdefault("TERM", "dumb")
-
-    # Only route through proxy when explicitly requested (fallback mode)
-    if use_proxy and selected_backend == "claude":
-        _PROXY_URL = os.environ.get("APPLYPILOT_PROXY_URL", "http://localhost:4000")
-        try:
-            import urllib.request
-            urllib.request.urlopen(f"{_PROXY_URL}/health", timeout=2)
-            env["ANTHROPIC_BASE_URL"] = _PROXY_URL
-            env["ANTHROPIC_API_KEY"] = "proxy-passthrough"
-            logger.info("Using proxy fallback for worker %d", worker_id)
-        except Exception:
-            pass  # Proxy not available — fall through to direct Claude
+        env = prepare_copilot_env(env)
+    elif selected_backend == "claude":
+        # Route Claude Code through copilot-api proxy if configured
+        proxy_url = os.environ.get(
+            "APPLYPILOT_COPILOT_PROXY_URL", "http://localhost:4141"
+        )
+        env["ANTHROPIC_BASE_URL"] = proxy_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "dummy"
+        env["DISABLE_NON_ESSENTIAL_MODEL_CALLS"] = "1"
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
     worker_dir = reset_worker_dir(worker_id)
 
-    # Pre-copy resume/cover-letter into the worker directory so
-    # Playwright MCP (which restricts uploads to CWD) can access them.
-    _current_dir = config.APPLY_WORKER_DIR / "current"
-    for src_file in _current_dir.glob("*") if _current_dir.exists() else []:
+    # Make sure worker-local copies of upload artifacts exist in the CWD.
+    current_dir = config.APPLY_WORKER_DIR / "current"
+    for src_file in current_dir.glob("*") if current_dir.exists() else []:
         dst_file = worker_dir / src_file.name
         if not dst_file.exists():
             shutil.copy(str(src_file), str(dst_file))
-    # Rewrite absolute paths in the prompt so the agent finds local copies
-    old_prefix = str(_current_dir).replace("\\", "/")
+
+    # Rewrite prompt paths from current/ to worker-specific directory.
+    old_prefix = str(current_dir).replace("\\", "/")
     new_prefix = str(worker_dir).replace("\\", "/")
     agent_prompt = agent_prompt.replace(old_prefix, new_prefix)
-    agent_prompt = agent_prompt.replace(str(_current_dir), str(worker_dir))
+    agent_prompt = agent_prompt.replace(str(current_dir), str(worker_dir))
 
     parse_stream_json = selected_backend == "claude"
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
-                 start_time=time.time(), actions=0, last_action=f"starting ({selected_backend})")
-    add_event(f"[W{worker_id}] Starting ({selected_backend}): {job['title'][:40]} @ {job.get('site', '')}")
+                 start_time=time.time(), actions=0,
+                 last_action=f"starting ({selected_backend})")
+    add_event(
+        f"[W{worker_id}] Starting ({selected_backend}): "
+        f"{job['title'][:40]} @ {job.get('site', '')}"
+    )
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -754,6 +644,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         f"Score: {job.get('fit_score', 'N/A')}/10\n"
         f"{'=' * 60}\n"
     )
+
+    # Per-job wall-clock timeout (seconds). Skip and move on if exceeded.
+    job_timeout = int(os.environ.get("APPLYPILOT_JOB_TIMEOUT", "420"))  # 7 min default
 
     start = time.time()
     stats: dict = {}
@@ -778,21 +671,38 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             proc.stdin.write(agent_prompt)
             proc.stdin.close()
 
-        # Hard deadline: kill the process if it exceeds this (seconds)
-        _JOB_TIMEOUT = 420
-
         text_parts: list[str] = []
-        timed_out = False
+
+        def _collect_text(value: object) -> list[str]:
+            out: list[str] = []
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    out.append(text)
+                return out
+            if isinstance(value, list):
+                for item in value:
+                    out.extend(_collect_text(item))
+                return out
+            if isinstance(value, dict):
+                for key in ("message", "content", "text", "result", "response"):
+                    if key in value:
+                        out.extend(_collect_text(value[key]))
+            return out
+
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
             for line in proc.stdout:
-                # Check hard deadline
-                if time.time() - start > _JOB_TIMEOUT:
-                    lf.write(f"\n  >> TIMEOUT after {_JOB_TIMEOUT}s — killing process\n")
-                    timed_out = True
+                # Wall-clock timeout: skip job if taking too long
+                if time.time() - start > job_timeout:
+                    elapsed = int(time.time() - start)
+                    add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s): {job['title'][:30]}")
+                    update_state(worker_id, status="failed",
+                                 last_action=f"TIMEOUT ({elapsed}s)")
                     _kill_process_tree(proc.pid)
-                    break
+                    proc = None
+                    return "failed:timeout", int((time.time() - start) * 1000)
 
                 line = line.strip()
                 if not line:
@@ -842,22 +752,28 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             }
                             text_parts.append(msg.get("result", ""))
                     else:
+                        # Copilot JSON stream/event output (plus plain fallback)
                         text_parts.append(line)
                         lf.write(line + "\n")
+                        msg = json.loads(line)
+                        if isinstance(msg, dict):
+                            extracted: list[str] = []
+                            if msg.get("type") == "assistant.message":
+                                extracted.extend(_collect_text(msg.get("data", {})))
+                            for key in ("message", "content", "text", "result", "response"):
+                                if key in msg:
+                                    extracted.extend(_collect_text(msg[key]))
+                            for chunk in extracted:
+                                if chunk and chunk != line:
+                                    text_parts.append(chunk)
+                                    lf.write(chunk + "\n")
                 except json.JSONDecodeError:
                     text_parts.append(line)
                     lf.write(line + "\n")
 
-        proc.wait(timeout=30)
+        proc.wait(timeout=300)
         returncode = proc.returncode
         proc = None
-
-        if timed_out:
-            duration_ms = int((time.time() - start) * 1000)
-            elapsed = int(time.time() - start)
-            add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s): {job['title'][:30]}")
-            update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-            return "failed:timeout", duration_ms
 
         if returncode and returncode < 0:
             return "skipped", int((time.time() - start) * 1000)
@@ -866,16 +782,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
-        # Detect Claude Code rate limit — stop pipeline immediately
-        out_lower = output.lower()
-        if ("hit your limit" in out_lower
-                or "out of extra usage" in out_lower
-                or "out of usage" in out_lower
-                or "rate limit" in out_lower):
-            add_event(f"[W{worker_id}] RATE LIMITED — stopping pipeline")
-            update_state(worker_id, status="rate_limited",
-                         last_action="rate limited — stopping")
-            return "rate_limited", duration_ms
+        if selected_backend == "copilot":
+            out_lower = output.lower()
+            if "from --model flag is not available" in out_lower:
+                add_event(f"[W{worker_id}] MODEL UNAVAILABLE ({elapsed}s)")
+                update_state(worker_id, status="failed", last_action="model unavailable")
+                return "failed:model_unavailable", duration_ms
+            if "(rate_limit)" in out_lower or ("rate limit" in out_lower and "try again" in out_lower):
+                add_event(f"[W{worker_id}] RATE LIMITED ({elapsed}s)")
+                update_state(worker_id, status="failed", last_action="rate limited")
+                return "failed:rate_limited", duration_ms
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"agent_{selected_backend}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
@@ -905,10 +821,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                              last_action=f"{result_status} ({elapsed}s)")
                 return normalized, duration_ms
 
-        # Fuzzy fallback for non-Claude models (Gemini/GPT) that use
-        # variant formatting like **Result: EXPIRED** or natural language
-        _output_lower = output.lower()
-        _fuzzy_map = {
+        # Fuzzy fallback for models/CLIs that do not emit strict RESULT lines.
+        output_lower = output.lower()
+        fuzzy_map = {
             "expired": [
                 r"result\s*:\s*expired",
                 r"job\s+(?:is\s+)?(?:not\s+found|expired|no\s+longer\s+(?:available|accepting))",
@@ -925,14 +840,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "applied": [
                 r"result\s*:\s*applied",
                 r"result\s*:\s*(?:success|submitted)",
-                r"application\s+(?:has\s+been\s+)?(?:submitted|received|sent)",
-                r"thank\s+you\s+for\s+(?:your\s+)?(?:applying|application|interest)",
-                r"successfully\s+(?:submitted|applied)",
             ],
         }
-        for fuzzy_status, patterns in _fuzzy_map.items():
+        for fuzzy_status, patterns in fuzzy_map.items():
             for pat in patterns:
-                if re.search(pat, _output_lower):
+                if re.search(pat, output_lower):
                     result_status = fuzzy_status.upper()
                     add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                     update_state(worker_id, status=fuzzy_status,
@@ -987,14 +899,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 
 PERMANENT_FAILURES: set[str] = {
-    "expired",
+    "expired", "captcha", "login_issue", "timeout",
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
-    "host_unreachable", "page_load_failed",
-    "browser_connection_error",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -1018,7 +928,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
                 model: str = "haiku", dry_run: bool = False,
-                agent_backend: str = "claude") -> tuple[int, int]:
+                agent_backend: str = "copilot",
+                persistent: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -1027,9 +938,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Agent model name.
         dry_run: Don't click Submit.
         agent_backend: Apply agent backend (claude, copilot, auto).
+        persistent: If True, retry transient failures with exponential
+                    backoff instead of moving to the next job.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -1040,6 +953,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
+    rate_limit_backoff = 0  # exponential backoff seconds for rate limits
+    pacer = get_pacer()
+    budget = get_budget()
+    rotator = get_rotator()
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -1067,63 +984,102 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
         empty_polls = 0
 
+        # ── Stealth: human-like inter-job pacing + budget check ──
+        if jobs_done > 0 and agent_backend in ("copilot", "auto"):
+            # Wait if request budget is exhausted for this time window
+            waited = budget.wait_if_exhausted()
+            if waited > 0:
+                add_event(f"[W{worker_id}] Budget cooldown {waited:.0f}s")
+
+            # Add adaptive slowdown when approaching budget limits
+            adaptive = budget.adaptive_delay()
+            if adaptive > 0:
+                update_state(worker_id, status="pacing",
+                             last_action=f"adaptive delay {adaptive:.0f}s")
+
+            # Human-like pause between jobs
+            pacer.sleep_inter_job()
+
+        # Stealth: rotate to a free-tier model if user didn't pin one
+        effective_model = model
+        if agent_backend in ("copilot", "auto") and rotator.enabled:
+            if model.lower() in ("haiku", "auto", ""):
+                effective_model = rotator.next_model()
+                if effective_model != model:
+                    add_event(f"[W{worker_id}] Model rotated: {effective_model}")
+
         chrome_proc = None
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
             result, duration_ms = run_job(
-                job, port=port, worker_id=worker_id,
-                model=model, dry_run=dry_run, use_proxy=False,
-                agent_backend=agent_backend)
+                job,
+                port=port,
+                worker_id=worker_id,
+                model=effective_model,
+                dry_run=dry_run,
+                agent_backend=agent_backend,
+            )
+
+            # Record this request against the budget tracker
+            budget.record()
 
             if result == "skipped":
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
-            elif result == "rate_limited":
-                # Claude usage cap hit — release lock and stop all workers.
-                # Usage resets on a per-period basis; no point retrying.
-                release_lock(job["url"])
-                add_event(f"[W{worker_id}] Rate limited — stopping apply workers")
-                update_state(worker_id, status="rate_limited",
-                             last_action="rate limited — stopped")
-                _stop_event.set()
-                break
-            elif result == "expired":
-                # Expired/closed job — mark permanently, don't retry
-                mark_result(job["url"], "expired", "expired",
-                            permanent=True, duration_ms=duration_ms)
-                add_event(f"[W{worker_id}] EXPIRED: {job['title'][:30]}")
-                update_state(worker_id, last_action="expired — skipped")
-                continue  # don't count as failure
-            elif result in ("captcha",):
-                # Captcha — retryable (improved hCaptcha fallback chain may work on retry)
-                mark_result(job["url"], "failed", result,
-                            permanent=False, duration_ms=duration_ms)
-                failed += 1
-                update_state(worker_id, jobs_failed=failed,
-                             jobs_done=applied + failed)
-            elif result == "login_issue":
-                # Login issue — retryable now that Gmail MCP is available
-                mark_result(job["url"], "failed", result,
-                            permanent=False, duration_ms=duration_ms)
-                failed += 1
-                update_state(worker_id, jobs_failed=failed,
-                             jobs_done=applied + failed)
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
+                rate_limit_backoff = 0  # reset backoff on success
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
+                is_perm = _is_permanent_failure(result)
                 mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result),
+                            permanent=is_perm,
                             duration_ms=duration_ms)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
+
+                # Persistent mode: on transient failure, sleep and retry
+                # instead of moving to the next job
+                if persistent and not is_perm and "rate_limited" not in result:
+                    transient_backoff = min(30 * (2 ** min(failed - 1, 4)), 300)
+                    add_event(
+                        f"[W{worker_id}] Transient failure, retrying in "
+                        f"{transient_backoff}s (persistent mode)"
+                    )
+                    update_state(
+                        worker_id, status="cooldown",
+                        last_action=f"transient backoff {transient_backoff}s",
+                    )
+                    if _stop_event.wait(timeout=transient_backoff):
+                        break
+                    # Don't count towards jobs_done so we re-acquire
+                    jobs_done -= 1
+                    continue
+
+                # Exponential backoff on rate limits
+                if "rate_limited" in result:
+                    rate_limit_backoff = min(
+                        (rate_limit_backoff or 30) * 2, 300
+                    )
+                    add_event(
+                        f"[W{worker_id}] Rate limited, backing off "
+                        f"{rate_limit_backoff}s"
+                    )
+                    update_state(
+                        worker_id, status="cooldown",
+                        last_action=f"rate-limit backoff {rate_limit_backoff}s",
+                    )
+                    if _stop_event.wait(timeout=rate_limit_backoff):
+                        break
+                else:
+                    rate_limit_backoff = 0  # reset on non-rate-limit result
 
         except KeyboardInterrupt:
             release_lock(job["url"])
@@ -1157,7 +1113,8 @@ def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "haiku",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
-         agent_backend: str = "claude") -> None:
+         agent_backend: str = "copilot",
+         persistent: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -1165,19 +1122,20 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Agent model name.
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
         agent_backend: Apply agent backend (claude, copilot, auto).
+        persistent: Retry transient failures with exponential backoff.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
     _stop_event.clear()
 
     config.ensure_dirs()
-    console = Console(legacy_windows=False)
+    console = Console()
 
     if continuous:
         effective_limit = 0
@@ -1246,6 +1204,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     model=model,
                     dry_run=dry_run,
                     agent_backend=agent_backend,
+                    persistent=persistent,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -1270,6 +1229,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             model=model,
                             dry_run=dry_run,
                             agent_backend=agent_backend,
+                            persistent=persistent,
                         ): i
                         for i in range(workers)
                     }

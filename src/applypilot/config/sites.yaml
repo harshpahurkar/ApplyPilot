@@ -38,9 +38,35 @@ blocked:
     - "%ultipro%"
     # SuccessFactors — requires account creation + CAPTCHA
     - "%successfactors%"
-    # Workday — CAN be automated with Claude Code + CapSolver + Gmail MCP
-    # - "%myworkdayjobs.com%"
-    # - "%workday.com%"
+    # Workday — multi-step account creation, 0% success rate
+    - "%myworkdayjobs.com%"
+    - "%workday.com%"
+    - "%myworkdaysite%"
+    # Indeed — most jobs redirect to random employer portals, 0% success on redirects
+    - "%ca.indeed.com%"
+    - "%indeed.com/viewjob%"
+    # CareerPuck — Greenhouse proxy but times out (Lyft-specific wrapper issues)
+    - "%careerpuck.com%"
+    # Misc portals with 0% success (account walls, complex multi-step, CAPTCHAs)
+    - "%careers.ford.com%"
+    - "%careers.google.com%"
+    - "%mongodb.com/careers%"
+    - "%jobs.elastic.co%"
+    - "%careers.wbd.com%"
+    - "%scotiabank.com%"
+    - "%capgemini.com%"
+    - "%webitinteractive.ca%"
+    - "%jobs.ea.com%"
+    - "%careers.risepeople.com%"
+    - "%bestbuycanadaorganic%"
+    - "%jobbank.gc.ca%"
+    - "%careers.societegenerale.com%"
+    - "%jobsearch.alstom.com%"
+    - "%careerprofile.epiroc.com%"
+    - "%contacthr.com%"
+    - "%careers.ssense.com%"
+    - "%careers.toasttab.com%"
+    - "%ttcportals.com%"
     # Job aggregators — not real ATS, no application forms
     - "%bebee.com%"
     - "%simplyhired%"
@@ -138,6 +164,12 @@ blocked_sso:
   - "login.microsoftonline.com"
   - "okta.com"
   - "auth0.com"
+  - "onelogin.com"
+  - "login.live.com"
+  - "adfs"
+  - "pingidentity.com"
+  - "duosecurity.com"
+  - "id.atlassian.com"
   - "sso.cisco.com"
 
 # ── Base URLs for URL resolution ─────────────────────────────────────────

@@ -19,15 +19,22 @@ import json
 import logging
 import os
 import platform
+import random
+import re
 import shlex
 import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
+from applypilot.copilot_chat_gate import copilot_chat_slot
+from applypilot.cost_tracker import get_session_costs
+from applypilot.apply.stealth import (
+    get_pacer, get_budget, prepare_copilot_env,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +56,16 @@ class ProviderConfig:
 
 def _truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def _copilot_base_command() -> list[str] | None:
@@ -75,6 +92,39 @@ def _copilot_base_command() -> list[str] | None:
     return None
 
 
+def _normalize_copilot_model(model: str) -> str:
+    """Map user-facing Claude-style aliases to Copilot-supported model names."""
+    requested = (model or "").strip()
+    default_model = (
+        os.environ.get("APPLYPILOT_COPILOT_LLM_DEFAULT_MODEL", "").strip()
+        or "gpt-4.1"
+    )
+
+    if not requested:
+        return default_model
+
+    lowered = requested.lower()
+    haiku_aliases = {
+        "haiku",
+        "claude-haiku",
+        "claude_haiku",
+        "claude-3-haiku",
+        "claude-3.5-haiku",
+        "claude-3-5-haiku",
+        "claude-3-5-haiku-latest",
+    }
+    if lowered in haiku_aliases:
+        mapped = (
+            os.environ.get("APPLYPILOT_COPILOT_LLM_HAIKU_EQUIVALENT", "").strip()
+            or default_model
+        )
+        if mapped != requested:
+            log.info("Mapped Copilot LLM model '%s' to '%s'", requested, mapped)
+        return mapped
+
+    return requested
+
+
 def _build_providers() -> list[ProviderConfig]:
     """Discover all configured LLM providers from environment variables.
 
@@ -88,10 +138,11 @@ def _build_providers() -> list[ProviderConfig]:
     if use_copilot:
         copilot_cmd = _copilot_base_command()
         if copilot_cmd:
+            configured_model = os.environ.get("COPILOT_LLM_MODEL", "haiku")
             providers.append(ProviderConfig(
                 name="copilot",
                 base_url="",
-                model=os.environ.get("COPILOT_LLM_MODEL", "gpt-4.1"),
+                model=_normalize_copilot_model(configured_model),
                 api_key="",
             ))
         else:
@@ -111,6 +162,7 @@ def _build_providers() -> list[ProviderConfig]:
             model=model_override or "gemini-2.0-flash",
             api_key=gemini_key,
         ))
+
 
     if deepseek_key:
         providers.append(ProviderConfig(
@@ -165,10 +217,24 @@ class _GeminiCompatForbidden(Exception):
 # ---------------------------------------------------------------------------
 
 _MAX_RETRIES = 3   # retries per provider
+_COPILOT_MAX_RETRIES = 2  # fewer retries for Copilot — fail fast, fall to Gemini
 _TIMEOUT = 300     # seconds (5 min — Ollama needs time for 8K token generation)
+
+# Channel-aware Copilot CLI timeouts (seconds).  Tailoring prompts are
+# large and Sonnet 4.6 can take 3-4 min to generate a full resume, so
+# tailoring gets the full 300s.  Scoring is fast (small prompt).
+_COPILOT_TIMEOUT_DEFAULTS: dict[str, int] = {
+    "scoring": 120,
+    "tailoring": 600,
+    "general": 150,
+}
 
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
 _RATE_LIMIT_BASE_WAIT = 10
+
+# Consecutive failure tracking: after this many consecutive failures
+# per provider, disable the provider for the rest of the session.
+_MAX_CONSECUTIVE_FAILURES = int(os.environ.get("APPLYPILOT_LLM_MAX_CONSECUTIVE_FAILURES", "5"))
 
 # Network-level errors that are safe to retry (connection drops, etc.)
 _RETRYABLE_NETWORK_ERRORS = (
@@ -177,6 +243,32 @@ _RETRYABLE_NETWORK_ERRORS = (
     httpx.ReadError,
     httpx.ConnectError,
 )
+
+
+def _jittered_backoff(base: float, attempt: int, cap: float = 120.0) -> float:
+    """Exponential backoff with 0-25% random jitter (prevents thundering herd)."""
+    delay = min(base * (2 ** attempt), cap)
+    jitter = delay * random.uniform(0, 0.25)
+    return delay + jitter
+
+
+def _copilot_channel_from_messages(messages: list[dict]) -> str:
+    """Infer Copilot LLM lane from prompt content."""
+    system_blob = "\n".join(
+        str(m.get("content", ""))
+        for m in messages
+        if str(m.get("role", "")).lower() == "system"
+    ).lower()
+
+    if "ats-aware job fit evaluator" in system_blob or "respond in exactly this format" in system_blob and "score:" in system_blob:
+        return "scoring"
+    if "elite ats optimization engine" in system_blob or "resume tailoring" in system_blob:
+        return "tailoring"
+    if "resume quality judge" in system_blob:
+        return "tailoring"
+    if "cover letter" in system_blob:
+        return "tailoring"
+    return "general"
 
 
 class LLMClient:
@@ -199,14 +291,103 @@ class LLMClient:
         self._use_native_gemini: bool = False
         # Circuit breaker: skip provider until cooldown_until timestamp
         self._cooldown_until: dict[str, float] = {}
+        # Consecutive failure tracking: counts reset on success, provider
+        # disabled for the session when _MAX_CONSECUTIVE_FAILURES reached.
+        self._consecutive_failures: dict[str, int] = {p.name: 0 for p in providers}
+        self._session_disabled: dict[str, bool] = {p.name: False for p in providers}
         # Per-provider mutex: serializes concurrent requests so only one thread
         # hits a given provider at a time (prevents simultaneous 429 storms).
-        # Copilot can handle parallel invocations better, so we leave it unlocked.
+        # Copilot serialization defaults ON for usage-cap safety.
+        self._copilot_serialize = _truthy(os.environ.get("APPLYPILOT_COPILOT_LLM_SERIALIZE", "1"))
         self._provider_locks: dict[str, threading.Lock] = {
-            p.name: threading.Lock() for p in providers if p.name != "copilot"
+            p.name: threading.Lock()
+            for p in providers
+            if p.name != "copilot" or self._copilot_serialize
         }
+        self._copilot_throttle_lock = threading.Lock()
+        self._copilot_last_request_ts = 0.0
+        self._copilot_min_interval = max(
+            0.0,
+            _safe_float_env("APPLYPILOT_COPILOT_LLM_MIN_INTERVAL", 0.0),
+        )
+        self._copilot_retry_base_wait = max(
+            0.0,
+            _safe_float_env("APPLYPILOT_COPILOT_LLM_RETRY_BASE_WAIT", 15.0),
+        )
+        self._max_cooldown_wait = max(
+            0.0,
+            _safe_float_env("APPLYPILOT_LLM_MAX_COOLDOWN_WAIT", 0.0),
+        )
+        self._copilot_chat_mode = os.environ.get("APPLYPILOT_COPILOT_LLM_CHAT_MODE", "single").strip().lower()
+        if self._copilot_chat_mode not in {"single", "dual", "stateless"}:
+            self._copilot_chat_mode = "single"
+
+        self._copilot_resume_id = os.environ.get("APPLYPILOT_COPILOT_LLM_RESUME_ID", "").strip()
+        self._copilot_resume_ids = {
+            "scoring": os.environ.get("APPLYPILOT_COPILOT_LLM_RESUME_ID_SCORING", "").strip(),
+            "tailoring": os.environ.get("APPLYPILOT_COPILOT_LLM_RESUME_ID_TAILORING", "").strip(),
+            "general": os.environ.get("APPLYPILOT_COPILOT_LLM_RESUME_ID_GENERAL", "").strip(),
+        }
+        self._copilot_continue = (
+            _truthy(os.environ.get("APPLYPILOT_COPILOT_LLM_CONTINUE", "0"))
+            and not self._copilot_resume_id
+        )
         names = [p.name for p in providers]
         log.info("LLM providers loaded: %s (primary: %s)", names, names[0])
+
+    def _copilot_session_args_for_channel(self, channel: str) -> list[str]:
+        """Build --resume/--continue args for a specific Copilot lane."""
+        channel_key = channel if channel in self._copilot_resume_ids else "general"
+        resume_id = self._copilot_resume_ids.get(channel_key, "")
+        if resume_id:
+            return ["--resume", resume_id]
+
+        if self._copilot_resume_id:
+            return ["--resume", self._copilot_resume_id]
+
+        if self._copilot_chat_mode == "stateless":
+            return []
+
+        if self._copilot_chat_mode == "dual":
+            # Dual mode avoids implicit --continue because Copilot CLI continue
+            # is global and can blend scoring/tailoring context unexpectedly.
+            return []
+
+        return ["--continue"] if self._copilot_continue else []
+
+    def _copilot_rate_limit_cooldown_seconds(self, error_text: str) -> float:
+        """Infer cooldown from rate-limit messages, with a safe fallback."""
+        text = (error_text or "").lower()
+        m_hours = re.search(r"try again in\s*(\d+)\s*hour", text)
+        if m_hours:
+            return float(max(1, int(m_hours.group(1))) * 3600)
+        m_mins = re.search(r"try again in\s*(\d+)\s*min", text)
+        if m_mins:
+            return float(max(1, int(m_mins.group(1))) * 60)
+        return max(30.0, _safe_float_env("APPLYPILOT_COPILOT_LLM_RATE_LIMIT_COOLDOWN", 7200.0))
+
+    def _throttle_copilot_llm(self) -> None:
+        """Pace Copilot LLM calls to reduce burst-based rate-limit hits."""
+        if self._copilot_min_interval <= 0:
+            return
+        with self._copilot_throttle_lock:
+            now = time.time()
+            elapsed = now - self._copilot_last_request_ts
+            wait_s = max(0.0, self._copilot_min_interval - elapsed)
+            if wait_s > 0:
+                time.sleep(wait_s)
+            self._copilot_last_request_ts = time.time()
+
+    def _record_failure(self, provider_name: str) -> None:
+        """Increment consecutive failure counter; disable provider if threshold reached."""
+        self._consecutive_failures[provider_name] = self._consecutive_failures.get(provider_name, 0) + 1
+        count = self._consecutive_failures[provider_name]
+        if count >= _MAX_CONSECUTIVE_FAILURES and not self._session_disabled.get(provider_name, False):
+            self._session_disabled[provider_name] = True
+            log.warning(
+                "[%s] disabled for session after %d consecutive failures",
+                provider_name, count,
+            )
 
     def _render_messages_for_copilot(self, messages: list[dict]) -> str:
         """Render OpenAI-style chat messages into a plain prompt string."""
@@ -287,30 +468,43 @@ class LLMClient:
             raise RuntimeError("Copilot CLI is not available on PATH")
 
         prompt = self._render_messages_for_copilot(messages)
-        timeout_s = int(os.environ.get("APPLYPILOT_COPILOT_LLM_TIMEOUT", "300"))
+        channel = _copilot_channel_from_messages(messages)
+        # Channel-aware timeout: scoring is snappy, tailoring needs more
+        env_key = f"APPLYPILOT_COPILOT_LLM_TIMEOUT_{channel.upper()}"
+        channel_default = _COPILOT_TIMEOUT_DEFAULTS.get(channel, 120)
+        timeout_s = int(os.environ.get(env_key, os.environ.get("APPLYPILOT_COPILOT_LLM_TIMEOUT", str(channel_default))))
 
         cmd = [
             *base_cmd,
-            "--model", provider.model,
+            "--model", _normalize_copilot_model(provider.model),
             "--no-ask-user",
             "--output-format", "json",
-            "-p", prompt,
         ]
+        cmd.extend(self._copilot_session_args_for_channel(channel))
 
-        env = os.environ.copy()
-        env.setdefault("CI", "1")
-        env.setdefault("TERM", "dumb")
-        env.setdefault("NO_COLOR", "1")
+        env = prepare_copilot_env()
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s,
-            env=env,
-        )
+        log.info("[copilot] calling %s channel=%s prompt=%d chars timeout=%ds",
+                 provider.model, channel, len(prompt), timeout_s)
+        # Pass prompt via stdin to avoid Windows command-line length limits
+        # (>~24K chars via -p causes subprocess.run to hang on Windows).
+        with copilot_chat_slot(f"llm:{channel}:{provider.model}") as gate_wait_s:
+            if gate_wait_s > 0.1:
+                log.info("[copilot] global chat gate wait %.1fs", gate_wait_s)
+            t0 = time.time()
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
+                env=env,
+                input=prompt,
+            )
+        elapsed = time.time() - t0
+        log.info("[copilot] response in %.1fs, exit=%d, stdout=%d stderr=%d",
+                 elapsed, proc.returncode, len(proc.stdout or ""), len(proc.stderr or ""))
         output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
 
         if proc.returncode != 0:
@@ -435,42 +629,71 @@ class LLMClient:
         max_tokens: int,
     ) -> str | None:
         """Inner implementation of _try_provider (called under the provider lock)."""
-        if provider.name == "copilot":
-            for attempt in range(_MAX_RETRIES):
-                try:
-                    content = self._chat_copilot(provider, messages, temperature, max_tokens)
-                    self._cooldown_until.pop(provider.name, None)
-                    log.debug("[%s] response OK (%d chars)", provider.name, len(content))
-                    return content
-                except subprocess.TimeoutExpired:
-                    if attempt < _MAX_RETRIES - 1:
-                        wait = 2 ** attempt
-                        log.warning("[%s] timeout, retrying in %ds", provider.name, wait)
-                        time.sleep(wait)
-                        continue
-                    self._cooldown_until[provider.name] = time.time() + 20
-                    log.warning("[%s] timeout after retries, cooling down 20s", provider.name)
-                    return None
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "429" in msg or "rate limit" in msg:
-                        self._cooldown_until[provider.name] = time.time() + 30
-                    if attempt < _MAX_RETRIES - 1:
-                        wait = 2 ** attempt
-                        log.warning("[%s] %s, retrying in %ds", provider.name, type(e).__name__, wait)
-                        time.sleep(wait)
-                        continue
-                    log.warning("[%s] %s, falling back...", provider.name, str(e)[:200])
-                    return None
-
-        is_gemini = provider.name == "gemini"
-
-        # Circuit breaker: skip this provider if it's in cooldown
+        # Circuit breaker: skip this provider if it's in cooldown.
         cooldown_until = self._cooldown_until.get(provider.name, 0)
         if time.time() < cooldown_until:
             remaining = int(cooldown_until - time.time())
             log.debug("[%s] in cooldown for %ds, skipping", provider.name, remaining)
             return None
+
+        # Session-level disable: after too many consecutive failures
+        if self._session_disabled.get(provider.name, False):
+            log.debug("[%s] session-disabled after consecutive failures, skipping", provider.name)
+            return None
+
+        if provider.name == "copilot":
+            for attempt in range(_COPILOT_MAX_RETRIES):
+                try:
+                    self._throttle_copilot_llm()
+                    # Stealth: human-like inter-LLM delay + budget tracking
+                    pacer = get_pacer()
+                    pacer.sleep_inter_llm()
+                    budget = get_budget()
+                    budget.wait_if_exhausted()
+                    content = self._chat_copilot(provider, messages, temperature, max_tokens)
+                    budget.record()
+                    # Success — reset cooldown, failure counter, and pacer penalty
+                    self._cooldown_until.pop(provider.name, None)
+                    self._consecutive_failures[provider.name] = 0
+                    pacer.report_success()
+                    log.debug("[%s] response OK (%d chars)", provider.name, len(content))
+                    # Copilot doesn't expose token counts — record call only
+                    get_session_costs().record_call(
+                        provider=provider.name, model=provider.model,
+                    )
+                    return content
+                except subprocess.TimeoutExpired:
+                    self._record_failure(provider.name)
+                    pacer.report_timeout()  # adaptive backoff
+                    if attempt < _COPILOT_MAX_RETRIES - 1:
+                        wait = _jittered_backoff(self._copilot_retry_base_wait, attempt)
+                        log.warning("[%s] timeout, retrying in %.1fs", provider.name, wait)
+                        if wait > 0:
+                            time.sleep(wait)
+                        continue
+                    self._cooldown_until[provider.name] = time.time() + 120
+                    log.warning("[%s] timeout after retries, cooling down 120s", provider.name)
+                    return None
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "429" in msg or "rate limit" in msg or "(rate_limit)" in msg:
+                        self._record_failure(provider.name)
+                        pacer.report_timeout()  # treat rate-limit as timeout for pacing
+                        cooldown = self._copilot_rate_limit_cooldown_seconds(str(e))
+                        self._cooldown_until[provider.name] = time.time() + cooldown
+                        log.warning("[%s] rate-limited, cooling down %.0fs", provider.name, cooldown)
+                        return None
+                    self._record_failure(provider.name)
+                    if attempt < _COPILOT_MAX_RETRIES - 1:
+                        wait = _jittered_backoff(self._copilot_retry_base_wait, attempt)
+                        log.warning("[%s] %s, retrying in %.1fs", provider.name, type(e).__name__, wait)
+                        if wait > 0:
+                            time.sleep(wait)
+                        continue
+                    log.warning("[%s] %s, falling back...", provider.name, str(e)[:200])
+                    return None
+
+        is_gemini = provider.name == "gemini"
 
         # Qwen3 optimization
         if "qwen" in provider.model.lower() and messages:
@@ -486,6 +709,10 @@ class LLMClient:
                         provider, messages, temperature, max_tokens,
                     )
                     log.debug("[%s/native] response OK (%d chars)", provider.name, len(content))
+                    self._consecutive_failures[provider.name] = 0
+                    get_session_costs().record_call(
+                        provider=provider.name, model=provider.model,
+                    )
                     return content
 
                 # Standard OpenAI-compat path
@@ -528,10 +755,8 @@ class LLMClient:
                         return None
 
                 if resp.status_code in (429, 503):
-                    # For Gemini: only 1 retry then immediate cooldown + fallback
-                    # (free tier quota exhausts quickly; no point burning 130s waiting)
-                    max_retries_here = 1 if is_gemini else _MAX_RETRIES
-                    if attempt < max_retries_here - 1:
+                    self._record_failure(provider.name)
+                    if attempt < _MAX_RETRIES - 1:
                         # Respect Retry-After header (Gemini sends this)
                         retry_after = (
                             resp.headers.get("Retry-After")
@@ -541,15 +766,15 @@ class LLMClient:
                             try:
                                 wait = float(retry_after)
                             except (ValueError, TypeError):
-                                wait = _RATE_LIMIT_BASE_WAIT * (2 ** attempt)
+                                wait = _jittered_backoff(_RATE_LIMIT_BASE_WAIT, attempt, cap=60)
                         elif is_gemini:
-                            wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                            wait = _jittered_backoff(_RATE_LIMIT_BASE_WAIT, attempt, cap=60)
                         else:
-                            wait = 2 ** attempt
+                            wait = _jittered_backoff(1, attempt, cap=60)
                         log.warning(
-                            "[%s] %s, retrying in %ds (attempt %d/%d)",
+                            "[%s] %s, retrying in %.1fs (attempt %d/%d)",
                             provider.name, resp.status_code, wait,
-                            attempt + 1, max_retries_here,
+                            attempt + 1, _MAX_RETRIES,
                         )
                         time.sleep(wait)
                         continue
@@ -567,15 +792,25 @@ class LLMClient:
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 log.debug("[%s] response OK (%d chars)", provider.name, len(content))
-                # Successful response — clear any cooldown for this provider
+                # Successful response — clear any cooldown and reset failure counter
                 self._cooldown_until.pop(provider.name, None)
+                self._consecutive_failures[provider.name] = 0
+                # Track cost
+                usage = data.get("usage", {})
+                get_session_costs().record_call(
+                    provider=provider.name,
+                    model=provider.model,
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                )
                 return content
 
             except _RETRYABLE_NETWORK_ERRORS as e:
+                self._record_failure(provider.name)
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RATE_LIMIT_BASE_WAIT if is_gemini else 2 ** attempt
+                    wait = _jittered_backoff(_RATE_LIMIT_BASE_WAIT if is_gemini else 1, attempt, cap=60)
                     log.warning(
-                        "[%s] %s, retrying in %ds (attempt %d/%d)",
+                        "[%s] %s, retrying in %.1fs (attempt %d/%d)",
                         provider.name, type(e).__name__, wait,
                         attempt + 1, _MAX_RETRIES,
                     )
@@ -586,6 +821,7 @@ class LLMClient:
                 return None
 
             except httpx.HTTPStatusError as e:
+                self._record_failure(provider.name)
                 sc = e.response.status_code
                 if sc == 402:
                     # Payment required — no credits. Put in 24h cooldown.
@@ -604,45 +840,105 @@ class LLMClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        _truncation_retry: bool = False,
     ) -> str:
         """Send a chat completion request, falling back across providers on failure.
 
-        If all providers are in cooldown, waits for the soonest to recover
-        rather than failing immediately (avoids silent data loss when Gemini
-        free-tier RPM is exhausted and there are no other providers).
+        Transparent mid-call fallback: if the primary provider is rate-limited
+        or fails, the request automatically falls through to the next provider.
+        If ALL providers are in cooldown, waits for the soonest to recover
+        rather than failing immediately (avoids silent data loss).
+
+        Reactive prompt truncation: if the prompt is rejected as too long by
+        all providers, the longest user message is trimmed by 30% and retried
+        once.
         """
         for provider in self.providers:
             result = self._try_provider(provider, messages, temperature, max_tokens)
             if result is not None:
                 return result
 
-        # All providers failed or in cooldown. If any have a finite cooldown,
-        # wait for the soonest one to recover and retry once.
+        # All providers failed or in cooldown.  Wait for the soonest cooldown
+        # to expire and retry — use _max_cooldown_wait if set, otherwise cap
+        # at 5 minutes (300s) to avoid blocking forever on long cooldowns.
         now = time.time()
+        max_wait = self._max_cooldown_wait if self._max_cooldown_wait > 0 else 300.0
         candidates = [
             (self._cooldown_until.get(p.name, 0), p)
             for p in self.providers
-            if self._cooldown_until.get(p.name, 0) < now + 300  # max 5-min wait
+            if not self._session_disabled.get(p.name, False)
+            and self._cooldown_until.get(p.name, 0) > 0
+            and self._cooldown_until.get(p.name, 0) < now + max_wait
         ]
         if candidates:
-            wake_at, wake_provider = min(candidates, key=lambda x: x[0])
-            wait = max(0.0, wake_at - now)
-            if wait > 0:
-                log.warning(
-                    "[%s] all providers in cooldown — waiting %.0fs for %s to recover",
-                    wake_provider.name, wait, wake_provider.name,
-                )
-                time.sleep(wait)
-            # Clear the cooldown and retry
-            self._cooldown_until.pop(wake_provider.name, None)
-            result = self._try_provider(wake_provider, messages, temperature, max_tokens)
-            if result is not None:
-                return result
+            # Sort by soonest wake time — try up to 2 providers
+            candidates.sort(key=lambda x: x[0])
+            for wake_at, wake_provider in candidates[:2]:
+                wait = max(0.0, wake_at - now)
+                if wait > 0:
+                    log.warning(
+                        "All providers exhausted — waiting %.0fs for %s to recover",
+                        wait, wake_provider.name,
+                    )
+                    time.sleep(wait)
+                self._cooldown_until.pop(wake_provider.name, None)
+                result = self._try_provider(wake_provider, messages, temperature, max_tokens)
+                if result is not None:
+                    return result
+                now = time.time()  # refresh after wait+retry
+
+        # Reactive prompt truncation: if this wasn't already a truncation retry,
+        # trim the longest user message by 30% and try all providers once more.
+        if not _truncation_retry:
+            truncated = self._truncate_messages(messages)
+            if truncated is not None:
+                log.warning("Retrying with truncated prompt (30%% shorter)")
+                try:
+                    return self.chat(
+                        truncated, temperature, max_tokens,
+                        _truncation_retry=True,
+                    )
+                except RuntimeError:
+                    pass  # truncation didn't help, fall through to original error
 
         raise RuntimeError(
             f"All LLM providers failed ({', '.join(p.name for p in self.providers)}). "
             "Check API keys, quotas, and network connectivity."
         )
+
+    @staticmethod
+    def _truncate_messages(messages: list[dict], fraction: float = 0.3) -> list[dict] | None:
+        """Trim the longest user message by `fraction` to fit context limits.
+
+        Returns a new message list or None if no user messages to truncate.
+        """
+        longest_idx = -1
+        longest_len = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user":
+                content_len = len(msg.get("content", ""))
+                if content_len > longest_len:
+                    longest_len = content_len
+                    longest_idx = i
+
+        if longest_idx < 0 or longest_len < 200:
+            return None  # nothing to trim
+
+        trimmed = list(messages)
+        content = trimmed[longest_idx]["content"]
+        keep = int(longest_len * (1 - fraction))
+        # Keep more from the beginning (likely contains instructions)
+        head = int(keep * 0.7)
+        tail = keep - head
+        trimmed[longest_idx] = {
+            **trimmed[longest_idx],
+            "content": (
+                content[:head]
+                + "\n\n[Content truncated to fit model context window]\n\n"
+                + content[-tail:]
+            ),
+        }
+        return trimmed
 
     def ask(self, prompt: str, **kwargs) -> str:
         """Convenience: single user prompt -> assistant response."""

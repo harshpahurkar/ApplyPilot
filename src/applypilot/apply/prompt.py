@@ -109,15 +109,12 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
     else:
         city_list = primary_city
 
-    return f"""== LOCATION CHECK (do this FIRST before any form) ==
-Read the job page. Determine the work arrangement. Then decide:
-- "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in {city_list} -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in another city BUT the posting also says "remote OK" or "remote option available" -> ELIGIBLE. Apply.
-- "Onsite only" or "hybrid only" in any city outside the list above with NO remote option -> NOT ELIGIBLE. Stop immediately. Output RESULT:FAILED:not_eligible_location
-- City is overseas (India, Philippines, Europe, etc.) with no remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
-- Cannot determine location -> Continue applying. If a screening question reveals it's non-local onsite, answer honestly and let the system reject if needed.
-Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
+    return f"""== LOCATION CHECK ==
+These jobs have already been pre-filtered. Almost all are remote or in {city_list}. APPLY TO EVERY JOB unless it is clearly onsite-only in a country the candidate cannot work in.
+- Remote, hybrid, work from anywhere, or located in {city_list} -> ELIGIBLE. Apply.
+- Cannot determine location -> ELIGIBLE. Apply anyway.
+- Onsite-only in a foreign country with no remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+When in doubt, APPLY. Do not waste time second-guessing location. These jobs were selected for this candidate."""
 
 
 def _build_salary_section(profile: dict) -> str:
@@ -560,7 +557,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL.
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
-3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
+3. LOCATION CHECK. These jobs are pre-filtered (mostly remote). Only skip if clearly onsite-only in a foreign country. When in doubt, apply.
 4. Find and click the Apply button. If email-only (page says "email resume to X"):
    - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
    - Output RESULT:APPLIED. Done.

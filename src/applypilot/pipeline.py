@@ -22,7 +22,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from applypilot.config import load_env, ensure_dirs
-from applypilot.database import init_db, get_connection, get_stats
+from applypilot.database import init_db, get_connection, get_stats, create_session, update_session
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -123,6 +123,24 @@ def _run_enrich(workers: int = 1) -> dict:
         return {"status": f"error: {e}"}
 
 
+def _copilot_llm_worker_cap(requested_workers: int) -> int:
+    """Optionally cap LLM worker fan-out when Copilot LLM is primary."""
+    import os
+
+    use_copilot_llm = str(os.environ.get("APPLYPILOT_USE_COPILOT_LLM", "")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not use_copilot_llm:
+        return requested_workers
+
+    raw_cap = os.environ.get("APPLYPILOT_COPILOT_LLM_MAX_WORKERS", "1")
+    try:
+        cap = max(1, int(raw_cap))
+    except ValueError:
+        cap = 1
+    return min(requested_workers, cap)
+
+
 def _run_score(workers: int = 3) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     try:
@@ -136,6 +154,14 @@ def _run_score(workers: int = 3) -> dict:
             and not os.environ.get("DEEPSEEK_API_KEY")
         )
         effective_workers = 1 if is_local_only else workers
+        copilot_capped = _copilot_llm_worker_cap(effective_workers)
+        if copilot_capped < effective_workers:
+            log.info(
+                "Copilot LLM enabled — capping scoring workers to %d (requested %d)",
+                copilot_capped,
+                workers,
+            )
+            effective_workers = copilot_capped
         if is_local_only and workers > 1:
             log.info("Local-only LLM detected — capping scoring to 1 worker (Ollama is serial)")
         from applypilot.scoring.scorer import run_scoring
@@ -161,6 +187,14 @@ def _run_tailor(min_score: int = 7, workers: int = 1, validation_mode: str = "no
             and not os.environ.get("DEEPSEEK_API_KEY")
         )
         effective_workers = 1 if is_local_only else workers
+        copilot_capped = _copilot_llm_worker_cap(effective_workers)
+        if copilot_capped < effective_workers:
+            log.info(
+                "Copilot LLM enabled — capping tailoring workers to %d (requested %d)",
+                copilot_capped,
+                workers,
+            )
+            effective_workers = copilot_capped
         if is_local_only and workers > 1:
             log.info("Local-only LLM detected — capping tailoring to 1 worker")
         from applypilot.scoring.tailor import run_tailoring
@@ -208,6 +242,14 @@ def _run_cover(min_score: int = 7, workers: int = 1, validation_mode: str = "nor
             and not os.environ.get("DEEPSEEK_API_KEY")
         )
         effective_workers = 1 if is_local_only else workers
+        copilot_capped = _copilot_llm_worker_cap(effective_workers)
+        if copilot_capped < effective_workers:
+            log.info(
+                "Copilot LLM enabled — capping cover-letter workers to %d (requested %d)",
+                copilot_capped,
+                workers,
+            )
+            effective_workers = copilot_capped
         if is_local_only and workers > 1:
             log.info("Local-only LLM detected — capping cover letters to 1 worker")
         from applypilot.scoring.cover_letter import run_cover_letters
@@ -549,6 +591,11 @@ def start_pipeline_background(
     ensure_dirs()
     init_db()
 
+    # Session tracking for background mode
+    import uuid
+    bg_session_id = f"auto-{uuid.uuid4().hex[:8]}"
+    create_session(bg_session_id, mode="auto-streaming", stages=" -> ".join(STAGE_ORDER))
+
     tracker = _StageTracker()
     stop_event = threading.Event()
     ordered = list(STAGE_ORDER)
@@ -668,8 +715,13 @@ def run_pipeline(
         stages = ["all"]
     ordered = _resolve_stages(stages)
 
-    # Banner
+    # Session tracking
+    import uuid
+    session_id = f"pipeline-{uuid.uuid4().hex[:8]}"
     mode = "streaming" if stream else "sequential"
+
+    if not dry_run:
+        create_session(session_id, mode=mode, stages=" -> ".join(ordered))
     console.print()
     console.print(Panel.fit(
         f"[bold]ApplyPilot Pipeline[/bold] ({mode})",
@@ -741,5 +793,22 @@ def run_pipeline(
     console.print(f"    Ready to apply: {final['ready_to_apply']}")
     console.print(f"    Applied:        {final['applied']}")
     console.print(f"{'=' * 70}\n")
+
+    # Finalize session
+    if not dry_run:
+        try:
+            from applypilot.cost_tracker import get_session_costs
+            costs = get_session_costs()
+            error_lines = [f"{k}: {v}" for k, v in result.get("errors", {}).items()]
+            update_session(
+                session_id,
+                status="completed" if not result.get("errors") else "completed_with_errors",
+                jobs_processed=final["total"],
+                jobs_applied=final["applied"],
+                total_cost_usd=costs.total_cost_usd,
+                error_summary="; ".join(error_lines) if error_lines else None,
+            )
+        except Exception as e:
+            log.debug("Failed to finalize session: %s", e)
 
     return result

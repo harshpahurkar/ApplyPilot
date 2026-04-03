@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -116,8 +117,12 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    stealth: bool = typer.Option(True, "--stealth/--no-stealth", help="Enable human-like pacing for Copilot LLM calls (default: on)."),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf, resolve_urls."""
+    import os
+    os.environ["APPLYPILOT_STEALTH_ENABLED"] = "1" if stealth else "0"
+
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline
@@ -173,6 +178,7 @@ def apply(
         help="Agent backend for auto-apply: claude, copilot, or auto.",
     ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
+    poll_interval: int = typer.Option(15, "--poll-interval", help="Seconds between queue polls when no job is available."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
@@ -181,9 +187,15 @@ def apply(
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    persistent: bool = typer.Option(False, "--persistent", help="Retry transient failures with exponential backoff."),
+    stealth: bool = typer.Option(True, "--stealth/--no-stealth", help="Enable human-like pacing and anti-rate-limit evasion (default: on)."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
+
+    # Configure stealth mode via environment before importing launcher
+    import os
+    os.environ["APPLYPILOT_STEALTH_ENABLED"] = "1" if stealth else "0"
 
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
@@ -235,14 +247,20 @@ def apply(
             "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
         ).fetchone()[0]
         if ready == 0:
-            console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
-            )
-            raise typer.Exit(code=1)
+            if continuous:
+                console.print(
+                    "[yellow]No tailored resumes ready yet.[/yellow]\n"
+                    "Starting in continuous mode anyway; apply workers will poll until jobs are ready."
+                )
+            else:
+                console.print(
+                    "[red]No tailored resumes ready.[/red]\n"
+                    "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+                )
+                raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -256,7 +274,9 @@ def apply(
         console.print(f"\n[bold]Run manually:[/bold]")
         if agent_backend == "copilot":
             console.print(
-                f"  copilot run --model {model} --mcp-config {mcp_path} < {prompt_file}"
+                f"  copilot --model {model} --additional-mcp-config @{mcp_path} "
+                f"--allow-all-tools --allow-all-paths --allow-all-urls "
+                f"--no-ask-user --output-format json -p \"<paste prompt text from {prompt_file}>\""
             )
         elif agent_backend == "auto":
             console.print(
@@ -265,7 +285,9 @@ def apply(
                 f"--permission-mode bypassPermissions < {prompt_file}"
             )
             console.print(
-                f"  copilot run --model {model} --mcp-config {mcp_path} < {prompt_file}"
+                f"  copilot --model {model} --additional-mcp-config @{mcp_path} "
+                f"--allow-all-tools --allow-all-paths --allow-all-urls "
+                f"--no-ask-user --output-format json -p \"<paste prompt text from {prompt_file}>\""
             )
         else:
             console.print(
@@ -284,8 +306,10 @@ def apply(
     console.print(f"  Workers:  {workers}")
     console.print(f"  Model:    {model}")
     console.print(f"  Backend:  {agent_backend}")
+    console.print(f"  Poll:     {poll_interval}s")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
+    console.print(f"  Stealth:  {stealth}")
     if url:
         console.print(f"  Target:   {url}")
     console.print()
@@ -298,8 +322,10 @@ def apply(
         model=model,
         dry_run=dry_run,
         continuous=continuous,
+        poll_interval=poll_interval,
         workers=workers,
         agent_backend=agent_backend,
+        persistent=persistent,
     )
 
 
@@ -317,6 +343,7 @@ def auto(
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Apply fills forms but does not submit."),
     threshold: int = typer.Option(30, "--threshold", "-t", help="Start applying after this many jobs are ready."),
+    stealth: bool = typer.Option(True, "--stealth/--no-stealth", help="Enable human-like pacing and anti-rate-limit evasion (default: on)."),
 ) -> None:
     """Run full pipeline + auto-apply concurrently (the big one).
 
@@ -328,6 +355,9 @@ def auto(
     After that, everything runs in tandem until you Ctrl+C.
     """
     import time as _time
+    import os as _os
+
+    _os.environ["APPLYPILOT_STEALTH_ENABLED"] = "1" if stealth else "0"
 
     _bootstrap()
 
@@ -362,6 +392,7 @@ def auto(
     console.print(f"  Apply threshold:  {threshold} ready jobs")
     console.print(f"  Headless:         {headless}")
     console.print(f"  Dry run:          {dry_run}")
+    console.print(f"  Stealth:          {stealth}")
 
     # Pre-run stats
     pre = get_stats()
@@ -383,13 +414,20 @@ def auto(
     try:
         while True:
             conn = get_connection()
-            ready = conn.execute(
-                "SELECT COUNT(*) FROM jobs "
+            ready_rows = conn.execute(
+                "SELECT tailored_resume_path FROM jobs "
                 "WHERE tailored_resume_path IS NOT NULL "
                 "  AND (apply_status IS NULL OR apply_status IN ('ready', 'failed')) "
                 "  AND (apply_attempts IS NULL OR apply_attempts < 5) "
                 f"  AND fit_score >= {min_score}"
-            ).fetchone()[0]
+            ).fetchall()
+
+            ready = 0
+            for row in ready_rows:
+                resume_path = row["tailored_resume_path"] or ""
+                resume_pdf = Path(resume_path).with_suffix(".pdf") if resume_path else None
+                if resume_pdf and resume_pdf.exists():
+                    ready += 1
 
             total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
             tailored = conn.execute(
@@ -439,6 +477,7 @@ def auto(
             continuous=True,
             workers=apply_workers,
             agent_backend=agent_backend,
+            persistent=True,
         )
 
     except KeyboardInterrupt:

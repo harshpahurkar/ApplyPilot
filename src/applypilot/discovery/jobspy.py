@@ -100,27 +100,7 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     Remote jobs are always accepted. Non-remote jobs must match an accept
     pattern and not match a reject pattern.
     """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
-
-    loc = location.lower()
-
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    # Reject non-remote matches
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    # No match -- reject unknown
-    return False
+    return config.location_matches_filter(location, accept, reject, allow_unknown=True)
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------

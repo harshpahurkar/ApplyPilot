@@ -5,6 +5,7 @@ a profile dict (from applypilot.config.load_profile()) and validates against the
 actual skills, companies, projects, and school.
 """
 
+import os
 import re
 import logging
 
@@ -680,9 +681,16 @@ def validate_ats_compliance(data: dict, jd_text: str) -> dict:
 
     coverage = 1.0 - (len(missing) / len(jd_keywords)) if jd_keywords else 1.0
 
-    if coverage < 0.85:
+    min_keyword_coverage = 0.90
+    try:
+        min_keyword_coverage = float(os.environ.get("APPLYPILOT_ATS_MIN_KEYWORD_COVERAGE", "0.90"))
+    except ValueError:
+        min_keyword_coverage = 0.90
+    min_keyword_coverage = max(0.0, min(1.0, min_keyword_coverage))
+
+    if coverage < min_keyword_coverage:
         errors.append(
-            f"Keyword coverage {coverage:.0%} < 85%. Missing: {', '.join(missing[:8])}"
+            f"Keyword coverage {coverage:.0%} < {min_keyword_coverage:.0%}. Missing: {', '.join(missing[:8])}"
         )
     elif missing:
         warnings.append(
@@ -723,15 +731,22 @@ def validate_ats_compliance(data: dict, jd_text: str) -> dict:
     # ── Step 3: Bullet Quality Checks ──
     import re as _re
 
-    # 3a: Line overflow — bullets over 135 chars will wrap in Jake's template
+    # 3a: Line overflow — long bullets wrap and hurt readability/ATS parsing.
+    max_bullet_chars = 130
+    try:
+        max_bullet_chars = int(os.environ.get("APPLYPILOT_ATS_MAX_BULLET_CHARS", "130"))
+    except ValueError:
+        max_bullet_chars = 130
+    max_bullet_chars = max(90, min(220, max_bullet_chars))
+
     long_bullets: list[str] = []
     for bullet in all_bullets:
-        if len(bullet) > 135:
+        if len(bullet) > max_bullet_chars:
             long_bullets.append(f'"{bullet[:60]}..." ({len(bullet)} chars)')
     if long_bullets:
         errors.append(
-            f"Line overflow: {len(long_bullets)} bullets exceed 135 chars and will wrap. "
-            f"Shorten each to under 130 chars to avoid orphan words on a 2nd line. Fix: {long_bullets[0]}"
+            f"Line overflow: {len(long_bullets)} bullets exceed {max_bullet_chars} chars and will wrap. "
+            f"Shorten each bullet to stay under the configured limit. Fix: {long_bullets[0]}"
         )
 
     # 3b: Tech dump at end — bullets ending with comma-separated tech lists
@@ -760,6 +775,121 @@ def validate_ats_compliance(data: dict, jd_text: str) -> dict:
             f"No metrics: {len(no_metric_bullets)}/{len(all_bullets)} bullets contain zero numbers. "
             f"Every bullet MUST have a concrete metric (%, count, $, timeframe). "
             f"Fix: {no_metric_bullets[0]}"
+        )
+
+    return {
+        "passed": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "keyword_coverage": coverage,
+        "bullet_compliance": bullet_compliance,
+        "missing_keywords": missing,
+        "bad_bullets": bad_bullets,
+    }
+
+
+def validate_ats_rendered_text(rendered_text: str, jd_text: str) -> dict:
+    """Validate ATS compliance on the final rendered resume text.
+
+    This acts as a post-assembly guardrail after JSON->text/LaTeX conversion,
+    so formatting/serialization artifacts can still trigger retries when needed.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not jd_text:
+        return {
+            "passed": True,
+            "errors": [],
+            "warnings": ["No JD text for rendered ATS check"],
+            "keyword_coverage": 0.0,
+            "bullet_compliance": 0.0,
+            "missing_keywords": [],
+            "bad_bullets": [],
+        }
+
+    jd_keywords = _extract_jd_keywords(jd_text)
+    if not jd_keywords:
+        return {
+            "passed": True,
+            "errors": [],
+            "warnings": ["No keywords extracted from JD"],
+            "keyword_coverage": 1.0,
+            "bullet_compliance": 1.0,
+            "missing_keywords": [],
+            "bad_bullets": [],
+        }
+
+    text_lower = (rendered_text or "").lower()
+    missing: list[str] = []
+    for kw in sorted(jd_keywords):
+        variants = [
+            kw,
+            kw.replace("/", " "),
+            kw.replace(" ", "/"),
+            kw.replace("-", " "),
+            kw.replace(" ", "-"),
+            kw.replace(".", ""),
+            kw.replace(".js", ""),
+        ]
+        if not any(v and v in text_lower for v in variants):
+            missing.append(kw)
+
+    coverage = 1.0 - (len(missing) / len(jd_keywords)) if jd_keywords else 1.0
+    min_keyword_coverage = 0.90
+    try:
+        min_keyword_coverage = float(os.environ.get("APPLYPILOT_ATS_MIN_KEYWORD_COVERAGE", "0.90"))
+    except ValueError:
+        min_keyword_coverage = 0.90
+    min_keyword_coverage = max(0.0, min(1.0, min_keyword_coverage))
+
+    if coverage < min_keyword_coverage:
+        errors.append(
+            f"Rendered keyword coverage {coverage:.0%} < {min_keyword_coverage:.0%}. Missing: {', '.join(missing[:8])}"
+        )
+    elif missing:
+        warnings.append(f"Rendered keyword coverage {coverage:.0%}. Missing: {', '.join(missing[:5])}")
+
+    bullets = [
+        line[2:].strip()
+        for line in (rendered_text or "").splitlines()
+        if line.strip().startswith("- ")
+    ]
+
+    bad_bullets: list[str] = []
+    for bullet in bullets:
+        b_lower = bullet.lower()
+        has_by = " by " in b_lower
+        has_resulting = "resulting in" in b_lower
+        if not has_by or not has_resulting:
+            bad_bullets.append(f"Missing formula structure: \"{bullet[:80]}...\"")
+
+    bullet_compliance = 1.0 - (len(bad_bullets) / len(bullets)) if bullets else 1.0
+    if bad_bullets:
+        errors.append(
+            f"Rendered bullet formula: {len(bad_bullets)}/{len(bullets)} bullets missing required structure. "
+            f"Fix: {bad_bullets[0]}"
+        )
+
+    max_bullet_chars = 130
+    try:
+        max_bullet_chars = int(os.environ.get("APPLYPILOT_ATS_MAX_BULLET_CHARS", "130"))
+    except ValueError:
+        max_bullet_chars = 130
+    max_bullet_chars = max(90, min(220, max_bullet_chars))
+
+    long_bullets = [b for b in bullets if len(b) > max_bullet_chars]
+    if long_bullets:
+        errors.append(
+            f"Rendered line overflow: {len(long_bullets)} bullets exceed {max_bullet_chars} chars. "
+            f"Fix: \"{long_bullets[0][:80]}...\""
+        )
+
+    metric_missing = [b for b in bullets if not re.search(r"\d", b)]
+    if metric_missing:
+        errors.append(
+            f"Rendered no-metric bullets: {len(metric_missing)}/{len(bullets)} bullets have zero numbers. "
+            f"Fix: \"{metric_missing[0][:80]}...\""
         )
 
     return {

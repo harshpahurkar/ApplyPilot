@@ -102,6 +102,7 @@ _STATUS_STYLES: dict[str, str] = {
     "expired": "dim red",
     "captcha": "magenta",
     "login_issue": "red",
+    "mfa_required": "red",
     "done": "bold",
 }
 

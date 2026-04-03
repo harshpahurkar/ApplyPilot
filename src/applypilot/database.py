@@ -10,7 +10,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import DB_PATH
+from applypilot.config import DB_PATH, DEFAULTS, load_blocked_sites
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -311,19 +311,42 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     # Application stage
     stats["applied"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'applied'"
     ).fetchone()[0]
 
     stats["apply_errors"] = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
     ).fetchone()[0]
 
-    stats["ready_to_apply"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
+    blocked_sites, blocked_patterns = load_blocked_sites()
+    blocked_sites_lc = {s.lower() for s in blocked_sites}
+    normalized_patterns = [p.replace("%", "").lower() for p in blocked_patterns if p]
+
+    ready_rows = conn.execute(
+        "SELECT site, url, application_url FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
-        "AND applied_at IS NULL "
-        "AND application_url IS NOT NULL"
-    ).fetchone()[0]
+        "AND (apply_status IS NULL OR apply_status IN ('ready', 'failed')) "
+        "AND (apply_attempts IS NULL OR apply_attempts < ?) "
+        "AND application_url IS NOT NULL "
+        "AND application_url != ''",
+        (DEFAULTS["max_apply_attempts"],),
+    ).fetchall()
+
+    ready_effective = 0
+    for row in ready_rows:
+        site = (row["site"] or "").lower()
+        apply_url = (row["application_url"] or row["url"] or "").lower()
+
+        if site in blocked_sites_lc:
+            continue
+        if any(pattern in apply_url for pattern in normalized_patterns):
+            continue
+        if "linkedin.com" in apply_url:
+            continue
+
+        ready_effective += 1
+
+    stats["ready_to_apply"] = ready_effective
 
     return stats
 

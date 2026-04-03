@@ -76,15 +76,44 @@ _CANADA_PATTERNS = (
 )
 
 
+# Non-Canada geo restrictions commonly seen in remote location strings.
+# If a role is remote but explicitly restricted to these regions, skip it.
+_REMOTE_NON_CANADA_HINTS = (
+    "us only", "usa only", "u.s. only", "united states only", "america only",
+    "remote - us", "remote (us", "us remote", "remote us",
+    "remote - usa", "remote (usa", "remote usa",
+    "remote - united states", "remote (united states",
+    "remote - india", "remote (india", "india only",
+    "remote - uk", "remote (uk", "uk only", "united kingdom only",
+    "remote - europe", "remote (europe", "europe only", "eu only",
+    "emea only", "apac only", "anz only",
+    "remote - australia", "australia only",
+    "remote - new zealand", "new zealand only",
+    "remote - singapore", "singapore only",
+)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse common truthy environment flag values."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _should_skip_role(title: str, location: str | None) -> str | None:
     """Return a skip reason if this job should be filtered out, else None.
 
-    Rules:
-      1. Senior / staff / principal / director / lead-architect -> always skip
-      2. Any job not in Canada and not remote -> skip
-      3. Intern / co-op not in Canada and not remote -> skip
-      4. Everything else -> keep
+        Rules:
+            1. Senior / staff / principal / director / lead-architect -> always skip
+            2. Canada locations are allowed
+            3. Fully remote jobs are allowed only when location is not geo-restricted to non-Canada
+            4. Non-remote jobs outside Canada are skipped
+            5. Unknown/blank location is skipped (safety to avoid non-Canada jobs)
     """
+    if _env_flag("APPLYPILOT_DISABLE_ROLE_FILTER", default=False):
+        return None
+
     t = title.lower()
     loc = (location or "").lower()
 
@@ -93,26 +122,20 @@ def _should_skip_role(title: str, location: str | None) -> str | None:
         if kw in t:
             return f"seniority:{kw.strip()}"
 
-    # Rule 2: Canada-only filter — skip any non-remote job outside Canada
+    # Safety first: if location is missing, do not apply.
+    if not loc.strip():
+        return "location:unknown"
+
+    # Rule 2: Canada-only filter for non-remote roles.
     is_remote = any(x in loc for x in ("remote", "anywhere", "work from home"))
     in_canada = any(x in loc for x in _CANADA_PATTERNS)
-    if not is_remote and not in_canada and loc:
+    if not is_remote and not in_canada:
         return "location:not_canada_not_remote"
 
-    # Rule 3: Skip US-only remote jobs — "Remote - US", "Remote - Seattle", etc.
-    # Global remote (Ireland, EU, UK, etc.) is acceptable.
-    if is_remote and loc:
-        us_only_remote = (
-            "remote - us", "remote (us", "us remote", "us only", "usa only",
-            "remote - sf", "remote - bay area", "remote - new york", "remote - seattle",
-            "remote - boston", "remote - chicago", "remote - austin", "remote - denver",
-            "remote - atlanta", "remote - dallas", "remote - miami", "remote - la",
-            "remote - los angeles", "remote - california", "remote - texas",
-            "(seattle, wa", "(san francisco", "(new york, ny", "(chicago, il",
-            "remote - washington", "remote - colorado", "remote - georgia",
-        )
-        if any(x in loc for x in us_only_remote) and not in_canada:
-            return "location:us_remote_only"
+    # Rule 3: For remote roles, reject explicit non-Canada geo restrictions.
+    if is_remote and not in_canada:
+        if any(x in loc for x in _REMOTE_NON_CANADA_HINTS):
+            return "location:remote_non_canada"
 
     return None  # keep
 
@@ -337,7 +360,8 @@ def mark_result(url: str, status: str, error: str | None = None,
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           applied_at = NULL
             WHERE url = ?
         """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
@@ -454,7 +478,8 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     else:
         conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL
+                           apply_attempts = 99, agent_id = NULL,
+                           applied_at = NULL
             WHERE url = ?
         """, (reason or "manual", url))
     conn.commit()
@@ -469,7 +494,8 @@ def reset_failed() -> int:
     conn = get_connection()
     cursor = conn.execute("""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
-                       apply_attempts = 0, agent_id = NULL
+                                             apply_attempts = 0, agent_id = NULL,
+                                             applied_at = NULL
         WHERE apply_status = 'failed'
           OR (apply_status IS NOT NULL AND apply_status != 'applied'
               AND apply_status != 'in_progress')
@@ -519,6 +545,7 @@ def _build_agent_command(
     model: str,
     mcp_config_path: Path,
     disallowed_tools: str,
+    prompt_text: str | None = None,
 ) -> list[str] | None:
     """Build subprocess command for the selected agent backend."""
     if backend == "claude":
@@ -536,32 +563,51 @@ def _build_agent_command(
         ]
 
     if backend == "copilot":
+        copilot_args = [
+            "--model", model,
+            "--additional-mcp-config", f"@{mcp_config_path}",
+            "--allow-all-tools",
+            "--allow-all-paths",
+            "--allow-all-urls",
+            "--no-ask-user",
+            "--output-format", "json",
+            "-p", prompt_text or "",
+        ]
+
         # Override when local Copilot CLI syntax differs:
-        # APPLYPILOT_COPILOT_CMD="copilot run --model {model} --mcp-config {mcp_config} -"
+        # APPLYPILOT_COPILOT_CMD="copilot --model {model} --additional-mcp-config @{mcp_config} -p {prompt}"
         custom = os.environ.get("APPLYPILOT_COPILOT_CMD", "").strip()
         if custom:
-            rendered = custom.format(model=model, mcp_config=str(mcp_config_path))
+            rendered = custom.format(
+                model=model,
+                mcp_config=str(mcp_config_path),
+                prompt=prompt_text or "",
+            )
             return shlex.split(rendered, posix=(platform.system() != "Windows"))
+
+        # Prefer invoking the npm package loader directly via node on Windows.
+        # This avoids wrapper (.bat/.ps1) command-line length limits.
+        appdata = os.environ.get("APPDATA", "")
+        node_exe = shutil.which("node")
+        npm_loader = Path(appdata) / "npm" / "node_modules" / "@github" / "copilot" / "npm-loader.js"
+        if platform.system() == "Windows" and node_exe and npm_loader.exists():
+            return [
+                node_exe,
+                str(npm_loader),
+                *copilot_args,
+            ]
 
         copilot_exe = shutil.which("copilot")
         if copilot_exe:
-            return [
-                copilot_exe,
-                "run",
-                "--model", model,
-                "--mcp-config", str(mcp_config_path),
-                "-",
-            ]
+            return [copilot_exe, *copilot_args]
 
         gh_exe = shutil.which("gh")
         if gh_exe:
             return [
                 gh_exe,
                 "copilot",
-                "agent",
-                "--model", model,
-                "--mcp-config", str(mcp_config_path),
-                "-",
+                "--",
+                *copilot_args,
             ]
 
     return None
@@ -604,6 +650,27 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         update_state(worker_id, status="failed", last_action=reason[:35])
         return f"failed:{reason}", duration_ms
 
+    # Copilot CLI v1 expects prompt text via -p (arg), so very large prompts
+    # can hit Windows command length limits. Keep both the opening context and
+    # the RESULT protocol at the tail by truncating head+tail.
+    if selected_backend == "copilot":
+        max_chars = int(os.environ.get("APPLYPILOT_COPILOT_PROMPT_MAX", "12000"))
+        if len(agent_prompt) > max_chars:
+            head = int(max_chars * 0.7)
+            tail = max_chars - head
+            agent_prompt = (
+                agent_prompt[:head]
+                + "\n\n[Prompt truncated for Copilot CLI argument limits]\n\n"
+                + agent_prompt[-tail:]
+            )
+            add_event(f"[W{worker_id}] Copilot prompt truncated ({max_chars} chars)")
+            logger.warning(
+                "Worker %d: truncated Copilot prompt from %d to ~%d chars",
+                worker_id,
+                len(agent_prompt),
+                max_chars,
+            )
+
     # Gmail tools that must never be used (safety: read-only Gmail access)
     _disallowed = ",".join([
         "mcp__gmail__draft_email",
@@ -628,6 +695,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         model=model,
         mcp_config_path=mcp_config_path,
         disallowed_tools=_disallowed,
+        prompt_text=agent_prompt,
     )
     if not cmd:
         duration_ms = 0
@@ -639,6 +707,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    if selected_backend == "copilot":
+        env.setdefault("CI", "1")
+        env.setdefault("TERM", "dumb")
 
     # Only route through proxy when explicitly requested (fallback mode)
     if use_proxy and selected_backend == "claude":
@@ -691,7 +762,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     try:
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
+            stdin=(subprocess.PIPE if selected_backend == "claude" else subprocess.DEVNULL),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -703,8 +774,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs[worker_id] = proc
 
-        proc.stdin.write(agent_prompt)
-        proc.stdin.close()
+        if selected_backend == "claude" and proc.stdin:
+            proc.stdin.write(agent_prompt)
+            proc.stdin.close()
 
         # Hard deadline: kill the process if it exceeds this (seconds)
         _JOB_TIMEOUT = 420
@@ -818,12 +890,20 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`".\s]+$', '', s).strip()
 
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
+        explicit_statuses = {
+            "APPLIED": "applied",
+            "SUCCESS": "applied",
+            "SUBMITTED": "applied",
+            "EXPIRED": "expired",
+            "CAPTCHA": "captcha",
+            "LOGIN_ISSUE": "login_issue",
+        }
+        for result_status, normalized in explicit_statuses.items():
             if f"RESULT:{result_status}" in output:
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
-                update_state(worker_id, status=result_status.lower(),
+                update_state(worker_id, status=normalized,
                              last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
+                return normalized, duration_ms
 
         # Fuzzy fallback for non-Claude models (Gemini/GPT) that use
         # variant formatting like **Result: EXPIRED** or natural language
@@ -844,6 +924,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "login_issue": [r"result\s*:\s*login.?issue", r"login\s+(?:required|wall)"],
             "applied": [
                 r"result\s*:\s*applied",
+                r"result\s*:\s*(?:success|submitted)",
                 r"application\s+(?:has\s+been\s+)?(?:submitted|received|sent)",
                 r"thank\s+you\s+for\s+(?:your\s+)?(?:applying|application|interest)",
                 r"successfully\s+(?:submitted|applied)",

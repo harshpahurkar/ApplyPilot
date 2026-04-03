@@ -64,20 +64,22 @@ def _parse_score_response(response: str) -> dict:
     """
     score = 0
     keywords = ""
-    reasoning = response
+    reasoning = response.strip()
 
-    for line in response.split("\n"):
-        line = line.strip()
-        if line.startswith("SCORE:"):
-            try:
-                score = int(re.search(r"\d+", line).group())
-                score = max(1, min(10, score))
-            except (AttributeError, ValueError):
-                score = 0
-        elif line.startswith("KEYWORDS:"):
-            keywords = line.replace("KEYWORDS:", "").strip()
-        elif line.startswith("REASONING:"):
-            reasoning = line.replace("REASONING:", "").strip()
+    score_match = re.search(r"(?im)^\s*score\s*:\s*(\d+)", response)
+    if score_match:
+        try:
+            score = max(1, min(10, int(score_match.group(1))))
+        except ValueError:
+            score = 0
+
+    kw_match = re.search(r"(?im)^\s*keywords\s*:\s*(.+)$", response)
+    if kw_match:
+        keywords = kw_match.group(1).strip()
+
+    reason_match = re.search(r"(?ims)^\s*reasoning\s*:\s*(.+)$", response)
+    if reason_match:
+        reasoning = reason_match.group(1).strip()
 
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 

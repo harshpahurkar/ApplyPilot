@@ -6,6 +6,7 @@ If the primary provider is rate-limited (429) or down (503/timeout),
 the request automatically falls through to the next provider.
 
 Priority order:
+    0. Copilot CLI (optional, APPLYPILOT_USE_COPILOT_LLM=1)
   1. GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash) — FREE tier
   2. DEEPSEEK_API_KEY -> DeepSeek (default: deepseek-chat) — cheap fallback
   3. OPENAI_API_KEY  -> OpenAI (default: gpt-4o)
@@ -14,10 +15,16 @@ Priority order:
 LLM_MODEL env var overrides the model name for the PRIMARY provider only.
 """
 
+import json
 import logging
 import os
+import platform
+import shlex
+import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass
 
 import httpx
@@ -40,13 +47,57 @@ class ProviderConfig:
     api_key: str
 
 
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _copilot_base_command() -> list[str] | None:
+    """Resolve the executable command prefix for Copilot CLI invocations."""
+    custom = os.environ.get("APPLYPILOT_COPILOT_LLM_CMD", "").strip()
+    if custom:
+        return shlex.split(custom, posix=(platform.system() != "Windows"))
+
+    if platform.system() == "Windows":
+        appdata = os.environ.get("APPDATA", "")
+        node_exe = shutil.which("node")
+        npm_loader = Path(appdata) / "npm" / "node_modules" / "@github" / "copilot" / "npm-loader.js"
+        if node_exe and npm_loader.exists():
+            return [node_exe, str(npm_loader)]
+
+    copilot_exe = shutil.which("copilot")
+    if copilot_exe:
+        return [copilot_exe]
+
+    gh_exe = shutil.which("gh")
+    if gh_exe:
+        return [gh_exe, "copilot", "--"]
+
+    return None
+
+
 def _build_providers() -> list[ProviderConfig]:
     """Discover all configured LLM providers from environment variables.
 
-    Returns a list ordered by priority: Gemini (free) -> DeepSeek -> OpenAI -> Local.
+    Returns providers in priority order, with optional Copilot first:
+    Copilot (optional) -> Gemini -> DeepSeek -> OpenAI -> Local.
     """
     model_override = os.environ.get("LLM_MODEL", "")
     providers: list[ProviderConfig] = []
+
+    use_copilot = _truthy(os.environ.get("APPLYPILOT_USE_COPILOT_LLM"))
+    if use_copilot:
+        copilot_cmd = _copilot_base_command()
+        if copilot_cmd:
+            providers.append(ProviderConfig(
+                name="copilot",
+                base_url="",
+                model=os.environ.get("COPILOT_LLM_MODEL", "gpt-4.1"),
+                api_key="",
+            ))
+        else:
+            log.warning(
+                "APPLYPILOT_USE_COPILOT_LLM=1 but Copilot CLI was not found; skipping Copilot provider"
+            )
 
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -91,7 +142,8 @@ def _build_providers() -> list[ProviderConfig]:
     if not providers:
         raise RuntimeError(
             "No LLM provider configured. "
-            "Set GEMINI_API_KEY, DEEPSEEK_API_KEY, OPENAI_API_KEY, or LLM_URL."
+            "Set APPLYPILOT_USE_COPILOT_LLM=1, GEMINI_API_KEY, "
+            "DEEPSEEK_API_KEY, OPENAI_API_KEY, or LLM_URL."
         )
 
     return providers
@@ -149,11 +201,126 @@ class LLMClient:
         self._cooldown_until: dict[str, float] = {}
         # Per-provider mutex: serializes concurrent requests so only one thread
         # hits a given provider at a time (prevents simultaneous 429 storms).
+        # Copilot can handle parallel invocations better, so we leave it unlocked.
         self._provider_locks: dict[str, threading.Lock] = {
-            p.name: threading.Lock() for p in providers
+            p.name: threading.Lock() for p in providers if p.name != "copilot"
         }
         names = [p.name for p in providers]
         log.info("LLM providers loaded: %s (primary: %s)", names, names[0])
+
+    def _render_messages_for_copilot(self, messages: list[dict]) -> str:
+        """Render OpenAI-style chat messages into a plain prompt string."""
+        sections: list[str] = [
+            "You are an expert resume tailoring and job-scoring assistant.",
+            "Follow the SYSTEM instructions strictly.",
+            "Return only the requested output format with no extra framing.",
+            "",
+        ]
+        for msg in messages:
+            role = str(msg.get("role", "user")).upper()
+            content = str(msg.get("content", "")).strip()
+            sections.append(f"[{role}]\n{content}\n")
+        rendered = "\n".join(sections).strip()
+
+        max_chars = int(os.environ.get("APPLYPILOT_COPILOT_LLM_PROMPT_MAX", "24000"))
+        if len(rendered) > max_chars:
+            head = int(max_chars * 0.7)
+            tail = max_chars - head
+            rendered = (
+                rendered[:head]
+                + "\n\n[Prompt truncated for Copilot LLM limits]\n\n"
+                + rendered[-tail:]
+            )
+        return rendered
+
+    def _extract_copilot_output_text(self, output: str) -> str:
+        """Parse Copilot JSON output and return the final assistant text."""
+        chunks: list[str] = []
+
+        def _maybe_add(obj: dict) -> None:
+            msg_type = str(obj.get("type", ""))
+            if msg_type == "assistant.message":
+                data = obj.get("data") or {}
+                text = data.get("message") or data.get("content")
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+            for key in ("content", "message", "text"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    chunks.append(val.strip())
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                _maybe_add(parsed)
+
+        if not chunks:
+            try:
+                parsed = json.loads(output)
+                if isinstance(parsed, dict):
+                    _maybe_add(parsed)
+            except json.JSONDecodeError:
+                pass
+
+        if chunks:
+            return chunks[-1]
+
+        # Fallback: plain-text output (rare, but possible if CLI formatting changes)
+        return output.strip()
+
+    def _chat_copilot(
+        self,
+        provider: ProviderConfig,
+        messages: list[dict],
+        _temperature: float,
+        _max_tokens: int,
+    ) -> str:
+        """Call Copilot CLI for non-browser LLM tasks (scoring/tailoring/cover)."""
+        base_cmd = _copilot_base_command()
+        if not base_cmd:
+            raise RuntimeError("Copilot CLI is not available on PATH")
+
+        prompt = self._render_messages_for_copilot(messages)
+        timeout_s = int(os.environ.get("APPLYPILOT_COPILOT_LLM_TIMEOUT", "300"))
+
+        cmd = [
+            *base_cmd,
+            "--model", provider.model,
+            "--no-ask-user",
+            "--output-format", "json",
+            "-p", prompt,
+        ]
+
+        env = os.environ.copy()
+        env.setdefault("CI", "1")
+        env.setdefault("TERM", "dumb")
+        env.setdefault("NO_COLOR", "1")
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s,
+            env=env,
+        )
+        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+
+        if proc.returncode != 0:
+            snippet = output.strip()[-400:]
+            raise RuntimeError(f"Copilot CLI exited {proc.returncode}: {snippet}")
+
+        text = self._extract_copilot_output_text(output)
+        if not text:
+            raise RuntimeError("Copilot CLI returned empty output")
+        return text
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -268,6 +435,34 @@ class LLMClient:
         max_tokens: int,
     ) -> str | None:
         """Inner implementation of _try_provider (called under the provider lock)."""
+        if provider.name == "copilot":
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    content = self._chat_copilot(provider, messages, temperature, max_tokens)
+                    self._cooldown_until.pop(provider.name, None)
+                    log.debug("[%s] response OK (%d chars)", provider.name, len(content))
+                    return content
+                except subprocess.TimeoutExpired:
+                    if attempt < _MAX_RETRIES - 1:
+                        wait = 2 ** attempt
+                        log.warning("[%s] timeout, retrying in %ds", provider.name, wait)
+                        time.sleep(wait)
+                        continue
+                    self._cooldown_until[provider.name] = time.time() + 20
+                    log.warning("[%s] timeout after retries, cooling down 20s", provider.name)
+                    return None
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "429" in msg or "rate limit" in msg:
+                        self._cooldown_until[provider.name] = time.time() + 30
+                    if attempt < _MAX_RETRIES - 1:
+                        wait = 2 ** attempt
+                        log.warning("[%s] %s, retrying in %ds", provider.name, type(e).__name__, wait)
+                        time.sleep(wait)
+                        continue
+                    log.warning("[%s] %s, falling back...", provider.name, str(e)[:200])
+                    return None
+
         is_gemini = provider.name == "gemini"
 
         # Circuit breaker: skip this provider if it's in cooldown

@@ -86,21 +86,30 @@ def _setup_profile() -> dict:
 
     # -- Personal --
     console.print("\n[bold cyan]Personal Information[/bold cyan]")
+    full_name = Prompt.ask("Full name")
     profile["personal"] = {
-        "full_name": Prompt.ask("Full name"),
+        "full_name": full_name,
+        "preferred_name": Prompt.ask("Preferred/nickname (leave blank to use first name)", default=""),
         "email": Prompt.ask("Email address"),
         "phone": Prompt.ask("Phone number", default=""),
         "city": Prompt.ask("City"),
+        "province_state": Prompt.ask("Province/State (e.g. Ontario, California)", default=""),
         "country": Prompt.ask("Country"),
+        "postal_code": Prompt.ask("Postal/ZIP code", default=""),
+        "address": Prompt.ask("Street address (optional, used for form auto-fill)", default=""),
         "linkedin_url": Prompt.ask("LinkedIn URL", default=""),
+        "github_url": Prompt.ask("GitHub URL (optional)", default=""),
+        "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
+        "website_url": Prompt.ask("Personal website URL (optional)", default=""),
         "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
 
     # -- Work Authorization --
     console.print("\n[bold cyan]Work Authorization[/bold cyan]")
     profile["work_authorization"] = {
-        "legally_authorized": Confirm.ask("Are you legally authorized to work in your target country?"),
-        "needs_sponsorship": Confirm.ask("Will you now or in the future need sponsorship?"),
+        "legally_authorized_to_work": Confirm.ask("Are you legally authorized to work in your target country?"),
+        "require_sponsorship": Confirm.ask("Will you now or in the future need sponsorship?"),
+        "work_permit_type": Prompt.ask("Work permit type (e.g. Citizen, PR, Open Work Permit — leave blank if N/A)", default=""),
     }
 
     # -- Compensation --
@@ -118,10 +127,13 @@ def _setup_profile() -> dict:
 
     # -- Experience --
     console.print("\n[bold cyan]Experience[/bold cyan]")
+    current_title = Prompt.ask("Current/most recent job title", default="")
+    target_role = Prompt.ask("Target role (what you're applying for, e.g. 'Senior Backend Engineer')", default=current_title)
     profile["experience"] = {
         "years_of_experience_total": Prompt.ask("Years of professional experience", default=""),
         "education_level": Prompt.ask("Highest education (e.g. Bachelor's, Master's, PhD, Self-taught)", default=""),
-        "current_title": Prompt.ask("Current/most recent job title", default=""),
+        "current_title": current_title,
+        "target_role": target_role,
     }
 
     # -- Skills Boundary --
@@ -152,7 +164,7 @@ def _setup_profile() -> dict:
     # -- EEO Voluntary (defaults) --
     profile["eeo_voluntary"] = {
         "gender": "Decline to self-identify",
-        "ethnicity": "Decline to self-identify",
+        "race_ethnicity": "Decline to self-identify",
         "veteran_status": "Decline to self-identify",
         "disability_status": "Decline to self-identify",
     }
